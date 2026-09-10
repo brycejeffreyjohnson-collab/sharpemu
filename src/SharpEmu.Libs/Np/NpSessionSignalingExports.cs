@@ -17,4 +17,26 @@ public static class NpSessionSignalingExports
         ctx[CpuRegister.Rax] = 0;
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
+
+    [SysAbiExport(
+        Nid = "aBuX0PX-T7I",
+        ExportName = "sceNpSessionSignalingCreateContext2",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceNpSessionSignaling")]
+    public static int NpSessionSignalingCreateContext2(CpuContext ctx)
+    {
+        ctx[CpuRegister.Rax] = 0;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
+        Nid = "r8mVMwlafF8",
+        ExportName = "sceNpSessionSignalingRequestPrepare",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceNpSessionSignaling")]
+    public static int NpSessionSignalingRequestPrepare(CpuContext ctx)
+    {
+        ctx[CpuRegister.Rax] = 0;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
 }

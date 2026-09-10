@@ -56,6 +56,28 @@ public static class NetExports
     }
 
     [SysAbiExport(
+        Nid = "6Oc0bLsIYe0",
+        ExportName = "sceNetGetMacAddress",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceNet")]
+    public static int NetGetMacAddress(CpuContext ctx)
+    {
+        ctx[CpuRegister.Rax] = 0;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
+        Nid = "v6M4txecCuo",
+        ExportName = "sceNetEtherNtostr",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceNet")]
+    public static int NetEtherNtostr(CpuContext ctx)
+    {
+        ctx[CpuRegister.Rax] = 0;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
         Nid = "cTGkc6-TBlI",
         ExportName = "sceNetTerm",
         Target = Generation.Gen4 | Generation.Gen5,

@@ -102,6 +102,50 @@ public static class HttpExports
         return ctx.SetReturn(0);
     }
 
+    [SysAbiExport(
+        Nid = "0S9tTH0uqTU",
+        ExportName = "sceHttpSetConnectTimeOut",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceHttp")]
+    public static int HttpSetConnectTimeOut(CpuContext ctx)
+    {
+        ctx[CpuRegister.Rax] = 0;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
+        Nid = "yigr4V0-HTM",
+        ExportName = "sceHttpSetRecvTimeOut",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceHttp")]
+    public static int HttpSetRecvTimeOut(CpuContext ctx)
+    {
+        ctx[CpuRegister.Rax] = 0;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
+        Nid = "xegFfZKBVlw",
+        ExportName = "sceHttpSetSendTimeOut",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceHttp")]
+    public static int HttpSetSendTimeOut(CpuContext ctx)
+    {
+        ctx[CpuRegister.Rax] = 0;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
+        Nid = "DK+GoXCNT04",
+        ExportName = "sceHttpsLoadCert",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceHttp")]
+    public static int HttpsLoadCert(CpuContext ctx)
+    {
+        ctx[CpuRegister.Rax] = 0;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
     private static void TraceHttp(string operation, int id, ulong arg0, ulong arg1, ulong arg2, ulong arg3)
     {
         if (!string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_HTTP"), "1", StringComparison.Ordinal))
