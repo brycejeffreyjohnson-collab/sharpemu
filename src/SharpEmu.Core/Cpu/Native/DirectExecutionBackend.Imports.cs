@@ -72,43 +72,7 @@ public sealed partial class DirectExecutionBackend
 
 	private unsafe static int RawVectoredHandlerManaged(void* exceptionInfo)
 	{
-		if (TryHandleGuestImageWriteFault(exceptionInfo))
-		{
-			return -1;
-		}
-
 		return TryRecoverUnresolvedSentinel(exceptionInfo);
-	}
-
-	/// <summary>
-	/// Windows counterpart of the POSIX SIGSEGV bridge into
-	/// <see cref="SharpEmu.HLE.GuestImageWriteTracker"/>. Guest code runs natively,
-	/// so a store into a surface the GPU backend has cached is an ordinary CPU
-	/// write with nothing to intercept — the page is write-protected instead and
-	/// the resulting fault is what tells the backend to re-upload. Without this
-	/// the cache serves the first upload forever, and anything the guest CPU
-	/// draws (a software-decoded movie frame, a memset fog layer) never reaches
-	/// the screen.
-	/// </summary>
-	private unsafe static bool TryHandleGuestImageWriteFault(void* exceptionInfo)
-	{
-		if (!SharpEmu.HLE.GuestImageWriteTracker.Enabled)
-		{
-			return false;
-		}
-
-		var exceptionRecord = ((EXCEPTION_POINTERS*)exceptionInfo)->ExceptionRecord;
-		// STATUS_ACCESS_VIOLATION, and only the write flavour: ExceptionInformation
-		// is [accessKind, address] with 0=read, 1=write, 8=DEP execute.
-		if (exceptionRecord->ExceptionCode != 3221225477u ||
-			exceptionRecord->NumberParameters < 2 ||
-			exceptionRecord->ExceptionInformation[0] != 1uL)
-		{
-			return false;
-		}
-
-		return SharpEmu.HLE.GuestImageWriteTracker.TryHandleWriteFault(
-			exceptionRecord->ExceptionInformation[1]);
 	}
 
 	private unsafe static int RawUnhandledFilterManaged(void* exceptionInfo)
@@ -200,6 +164,7 @@ public sealed partial class DirectExecutionBackend
 			return 18446744071562199042uL;
 		}
 		ImportStubEntry importStubEntry = _importEntries[importIndex];
+		using var registerPacketImport = SharpEmu.Libs.Diagnostics.AgcRegisterPacketProfile.MeasureImport(importStubEntry.Nid);
 		if (_perfHleHistogram)
 		{
 			RecordPerfHleCall(importStubEntry.Export?.Name ?? importStubEntry.Nid);
@@ -245,6 +210,13 @@ public sealed partial class DirectExecutionBackend
 		cpuContext[CpuRegister.R14] = *(ulong*)(argPackPtr + 80);
 		cpuContext[CpuRegister.R15] = *(ulong*)(argPackPtr + 88);
 		cpuContext[CpuRegister.Rsp] = (ulong)argPackPtr + 96uL;
+		cpuContext.SetImportStackArguments(
+			ReadImportStackArgument(argPackPtr, 0),
+			ReadImportStackArgument(argPackPtr, 1),
+			ReadImportStackArgument(argPackPtr, 2),
+			ReadImportStackArgument(argPackPtr, 3),
+			ReadImportStackArgument(argPackPtr, 4),
+			ReadImportStackArgument(argPackPtr, 5));
 		ulong value = cpuContext[CpuRegister.Rdi];
 		ulong value2 = cpuContext[CpuRegister.Rsi];
 		ulong num3 = cpuContext[CpuRegister.Rdx];
@@ -266,8 +238,8 @@ public sealed partial class DirectExecutionBackend
 		if (probeTarget &&
 			Interlocked.Increment(ref _probeImportReturnAddressCount) <= 2048)
 		{
-			var frameValue = TryReadStackU64(value4, out var savedRbp) ? savedRbp : 0;
-			var frameReturn = TryReadStackU64(value4 + sizeof(ulong), out var savedReturn)
+			var frameValue = TryReadImportStackU64(value4, out var savedRbp) ? savedRbp : 0;
+			var frameReturn = TryReadImportStackU64(value4 + sizeof(ulong), out var savedReturn)
 				? savedReturn
 				: 0;
 			Console.Error.WriteLine(
@@ -1245,10 +1217,45 @@ public sealed partial class DirectExecutionBackend
 		}
 	}
 
+	// Every import reads its stack arguments. On POSIX a region query takes the global region lock,
+	// so keep the last readable range per thread until any mapping changes. The signal handlers
+	// use TryReadStackU64 instead: they must not touch thread-static storage.
+	[ThreadStatic] private static ulong _importReadableStart;
+	[ThreadStatic] private static ulong _importReadableEnd;
+	[ThreadStatic] private static long _importReadableGeneration;
+
+	private unsafe static bool TryReadImportStackU64(ulong address, out ulong value)
+	{
+		if (OperatingSystem.IsWindows())
+		{
+			return TryReadHostQword(address, out value);
+		}
+
+		var generation = HostMemory.MappingGeneration;
+		if (generation == _importReadableGeneration &&
+			address >= _importReadableStart && address <= _importReadableEnd - 8)
+		{
+			value = *(ulong*)address;
+			return true;
+		}
+
+		if (!TryQueryReadableRange(address, out var start, out var end))
+		{
+			value = 0;
+			return false;
+		}
+
+		_importReadableStart = start;
+		_importReadableEnd = end;
+		_importReadableGeneration = generation;
+		value = *(ulong*)address;
+		return true;
+	}
+
 	private static ulong ReadImportStackArgument(nint argPackPtr, int index)
 	{
 		var address = checked((ulong)argPackPtr + 104UL + (ulong)index * sizeof(ulong));
-		return TryReadHostQword(address, out var value) ? value : 0;
+		return TryReadImportStackU64(address, out var value) ? value : 0;
 	}
 
 	private static GuestCpuContinuation CaptureImportBoundaryContinuation(
@@ -1359,6 +1366,13 @@ public sealed partial class DirectExecutionBackend
 		cpuContext[CpuRegister.R14] = *(ulong*)(argPackPtr + 80);
 		cpuContext[CpuRegister.R15] = *(ulong*)(argPackPtr + 88);
 		cpuContext[CpuRegister.Rsp] = (ulong)argPackPtr + 96uL;
+		cpuContext.SetImportStackArguments(
+			ReadImportStackArgument(argPackPtr, 0),
+			ReadImportStackArgument(argPackPtr, 1),
+			ReadImportStackArgument(argPackPtr, 2),
+			ReadImportStackArgument(argPackPtr, 3),
+			ReadImportStackArgument(argPackPtr, 4),
+			ReadImportStackArgument(argPackPtr, 5));
 
 		if (_activeGuestThreadState is { } activeGuestThreadState)
 		{
@@ -1619,13 +1633,10 @@ public sealed partial class DirectExecutionBackend
 			"8aI7R7WaOlc" or // sceAmprCommandBufferConstructor
 			"zgXifHT9ErY" or // sceVideoOutIsFlipPending
 			"V++UgBtQhn0" or // sceAgcGetDataPacketPayloadAddress
-			"qj7QZpgr9Uw" or // Gen5 graphics type-2 packet
+			"qj7QZpgr9Uw" or // Graphics context-state operation
 			"LtTouSCZjHM" or // sceAgcCbNop
 			"k3GhuSNmBLU" or // sceAgcCbDispatch
 			"UZbQjYAwwXM" or // sceAgcCbSetShRegistersDirect
-			"pFLArOT53+w" or // sceAgcDcbSetShRegisterDirect
-			"QhPDD513V0w" or // sceAgcDcbSetShRegisterDirectGetSize
-			"43WJ08sSugE" or // sceAgcDcbWaitOnAddressGetSize
 			"JrtiDtKeS38" or // sceAgcAcbResetQueue
 			"cFazmnXpJOE" or // sceAgcAcbEventWrite
 			"KT-hTp-Ch14" or // sceAgcAcbAcquireMem
@@ -1883,17 +1894,20 @@ public sealed partial class DirectExecutionBackend
 		return elapsedTicks >= (long)(_importLoopGuardSeconds * Stopwatch.Frequency);
 	}
 
-	internal static bool IsImportLoopGuardBoundary(string nid) =>
+	private static bool IsImportLoopGuardBoundary(string nid) =>
 		nid is
 			"1jfXLRVzisc" or // sceKernelUsleep
+			"1j3S3n-tTW4" or // sceKernelGetTscFrequency (polling/time base query)
 			"WKAXJ4XBPQ4" or // scePthreadCondWait
 			"BmMjYxmew1w" or // scePthreadCondTimedwait
 			"Op8TBGY5KHg" or // pthread_cond_wait
 			"27bAgiJmOh0" or // pthread_cond_timedwait
 			"n88vx3C5nW8" or // gettimeofday
-			"-2IRUCO--PM" or // clock_gettime
-			"0V5nU-Z6t4U" or // sceKernelGetProcessTime
-			"aI6lQW5v57k";   // sceKernelGetProcessTimeCounter
+			"lLMT9vJAck0" or // clock_gettime
+			"-2IRUCO--PM" or // sceKernelReadTsc
+			"4J2sUJmuHZQ" or // sceKernelGetProcessTime
+			"fgxnMeTNUtY" or // sceKernelGetProcessTimeCounter
+			"yH17Q6NWtVg";   // sceUserServiceGetEvent (non-blocking event poll)
 
 	private void ResetImportLoopPattern()
 	{
@@ -2292,17 +2306,18 @@ public sealed partial class DirectExecutionBackend
 		{
 			return false;
 		}
-		if (_runtimeSymbolsByName.TryGetValue(symbolName, out var value) && IsRuntimeSymbolAddressUsable(value))
+		var runtimeSymbolsByName = Volatile.Read(ref _runtimeSymbolsByName);
+		if (runtimeSymbolsByName.TryGetValue(symbolName, out var value) && IsRuntimeSymbolAddressUsable(value))
 		{
 			address = value;
 			return true;
 		}
-		if (symbolName.StartsWith("_", StringComparison.Ordinal) && _runtimeSymbolsByName.TryGetValue(symbolName[1..], out value) && IsRuntimeSymbolAddressUsable(value))
+		if (symbolName.StartsWith("_", StringComparison.Ordinal) && runtimeSymbolsByName.TryGetValue(symbolName[1..], out value) && IsRuntimeSymbolAddressUsable(value))
 		{
 			address = value;
 			return true;
 		}
-		if (_runtimeSymbolsByName.TryGetValue("_" + symbolName, out value) && IsRuntimeSymbolAddressUsable(value))
+		if (runtimeSymbolsByName.TryGetValue("_" + symbolName, out value) && IsRuntimeSymbolAddressUsable(value))
 		{
 			address = value;
 			return true;

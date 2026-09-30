@@ -20,6 +20,7 @@ public static class KernelPthreadExtendedCompatExports
     private const ulong NativeGuestStackSize = 0x20_0000UL;
     private const ulong NativeGuestStackStride = 0x100_0000UL;
     private const int DefaultInheritSched = 4;
+    private const int DefaultSoloSched = 0;
     private const int DefaultSchedPolicy = 1;
     private const int DefaultSchedPriority = DefaultThreadPriority;
     private const ulong SyntheticRwlockHandleBase = 0x00006003_0000_0000;
@@ -44,12 +45,14 @@ public static class KernelPthreadExtendedCompatExports
         CpuContext ctx,
         ulong attrAddress,
         out int priority,
-        out ulong affinityMask)
+        out ulong affinityMask,
+        out ulong stackSize)
     {
         if (attrAddress == 0)
         {
             priority = DefaultThreadPriority;
             affinityMask = DefaultThreadAffinityMask;
+            stackSize = DefaultStackSize;
             return;
         }
 
@@ -59,6 +62,7 @@ public static class KernelPthreadExtendedCompatExports
             var attributes = GetOrCreateAttrStateLocked(resolvedAddress);
             priority = attributes.SchedPriority;
             affinityMask = attributes.AffinityMask;
+            stackSize = attributes.StackSize;
         }
     }
 
@@ -189,7 +193,8 @@ public static class KernelPthreadExtendedCompatExports
         ulong GuardSize,
         int InheritSched,
         int SchedPolicy,
-        int SchedPriority)
+        int SchedPriority,
+        int SoloSched)
     {
         public static PthreadAttrState Default =>
             new(
@@ -200,7 +205,8 @@ public static class KernelPthreadExtendedCompatExports
                 DefaultGuardSize,
                 DefaultInheritSched,
                 DefaultSchedPolicy,
-                DefaultSchedPriority);
+                DefaultSchedPriority,
+                DefaultSoloSched);
     }
 
     [SysAbiExport(
@@ -860,6 +866,59 @@ public static class KernelPthreadExtendedCompatExports
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
+    [SysAbiExport(
+        Nid = "Dk6FC-TI+7Q",
+        ExportName = "scePthreadAttrSetsolosched",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libKernel")]
+    public static int PthreadAttrSetsolosched(CpuContext ctx)
+    {
+        var attrAddress = ctx[CpuRegister.Rdi];
+        var soloSched = unchecked((int)ctx[CpuRegister.Rsi]);
+        if (attrAddress == 0)
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
+        }
+
+        lock (_stateGate)
+        {
+            var state = GetOrCreateAttrStateLocked(attrAddress);
+            _attrStates[attrAddress] = state with { SoloSched = soloSched };
+        }
+
+        ctx[CpuRegister.Rax] = 0;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
+        Nid = "9RnL-m0+diQ",
+        ExportName = "scePthreadAttrGetsolosched",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libKernel")]
+    public static int PthreadAttrGetsolosched(CpuContext ctx)
+    {
+        var attrAddress = ctx[CpuRegister.Rdi];
+        var outSoloSchedAddress = ctx[CpuRegister.Rsi];
+        if (attrAddress == 0 || outSoloSchedAddress == 0)
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
+        }
+
+        PthreadAttrState state;
+        lock (_stateGate)
+        {
+            state = GetOrCreateAttrStateLocked(attrAddress);
+        }
+
+        if (!TryWriteInt32(ctx, outSoloSchedAddress, state.SoloSched))
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+        }
+
+        ctx[CpuRegister.Rax] = 0;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
     /// <summary>
     /// The POSIX-named alias of <see cref="PthreadAttrGetschedparam"/>. libKernel
     /// exports the same routine under two NIDs; middleware compiled against the
@@ -1154,12 +1213,20 @@ public static class KernelPthreadExtendedCompatExports
         PthreadRwlockTryLockCore(ctx, ctx[CpuRegister.Rdi], write: false);
 
     [SysAbiExport(
+        Nid = "bIHoZCTomsI",
+        ExportName = "scePthreadRwlockTrywrlock",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libKernel")]
+    public static int PthreadRwlockTrywrlock(CpuContext ctx) =>
+        PthreadRwlockTryLockCore(ctx, ctx[CpuRegister.Rdi], write: true);
+
+    [SysAbiExport(
         Nid = "XhWHn6P5R7U",
         ExportName = "pthread_rwlock_trywrlock",
         Target = Generation.Gen4 | Generation.Gen5,
         LibraryName = "libKernel")]
     public static int PosixPthreadRwlockTrywrlock(CpuContext ctx) =>
-        PthreadRwlockTryLockCore(ctx, ctx[CpuRegister.Rdi], write: true);
+        PthreadRwlockTrywrlock(ctx);
 
     /// <summary>
     /// Non-blocking counterpart of <see cref="PthreadRwlockLockCore"/>: acquires
