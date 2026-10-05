@@ -322,6 +322,9 @@ internal sealed class RecordingRenderHost : IRenderHost
     public void DrawIndexed(uint indexCount, uint instanceCount, uint firstIndex, int vertexOffset, uint firstInstance) =>
         Calls.Add($"draw_indexed {indexCount} {instanceCount} {firstIndex} {vertexOffset} {firstInstance}");
 
+    public void DrawIndexedIndirect(BufferBinding arguments) =>
+        Calls.Add($"draw_indexed_indirect {arguments.Handle:X}:{arguments.Offset:X}");
+
     public void Dispatch(uint groupsX, uint groupsY, uint groupsZ) => Calls.Add($"dispatch {groupsX} {groupsY} {groupsZ}");
 
     public bool TryDispatchIndirect(ulong argumentsAddress) => false;
@@ -385,6 +388,20 @@ internal sealed class RecordingRenderHost : IRenderHost
         return RegisteredDcc.Contains(address);
     }
 
+    public bool TryFillDccMetadata(ulong address, ulong size, uint fillValue)
+    {
+        Calls.Add($"fill_dcc {address:X} {size:X} {fillValue:X8}");
+        return RegisteredDcc.Contains(address);
+    }
+
+    public bool HostCopyAccepted { get; set; } = true;
+
+    public bool TryCopyWordsOnHost(ulong destination, ulong source, ulong sourceWords, ulong words)
+    {
+        Calls.Add($"host_copy {destination:X} {source:X} {sourceWords} {words}");
+        return HostCopyAccepted;
+    }
+
     public Exception Fatal(string message) => new RenderExecutorFatalException(message);
 }
 
@@ -411,7 +428,8 @@ internal sealed class FakePipelineProvider : IShaderPipelineProvider
         ShaderInterfaceRegisters shaderInterface,
         ContextRegisters context,
         ReadOnlySpan<ColorComponentMap> targetExportMapping,
-        bool pixelActive)
+        bool pixelActive,
+        bool depthBound)
     {
         Calls.Add($"get_graphics_programs pixelActive={pixelActive}");
         ExportMappings.Add(targetExportMapping.ToArray());

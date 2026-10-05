@@ -27,6 +27,7 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
     private readonly GuestBufferCache _bufferCache;
     private readonly IGuestBackedSpace _backing;
     private readonly SlotTable<CachedImage> _slots = new();
+    private readonly ImageBackingPool? _backingPool;
     private readonly ImagePageOwnerTable _pageOwners = new();
     private readonly Dictionary<Format, ResourceSlotIdentifier> _nullImages = new();
     private RecencyQueue<ResourceSlotIdentifier> _recencyQueue = new();
@@ -51,6 +52,7 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
         _readbackLinearImages = readbackLinearImages;
         _blit = new ColorToMultisampleDepthBlit(device, scheduler);
         _tiler = new GpuTiler(device, scheduler, bufferCache.GetUtilityBuffer(GpuBufferUsage.Stream));
+        _backingPool = ImageBackingPool.Enabled ? new ImageBackingPool(device) : null;
     }
 
     public ulong TotalUsedMemory => _totalUsedMemory;
@@ -95,6 +97,7 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
 
         _disposed = true;
         _slots.ForEach((_, image) => image.Dispose());
+        _backingPool?.Dispose();
         _tiler.Dispose();
         _blit.Dispose();
     }
@@ -120,7 +123,29 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
             return GetNullImage(request);
         }
 
+        var found = LookUpImage(ref request, exactFormat);
+        if (request.Role is ImageRole.Texture or ImageRole.StorageImage)
+        {
+            ref readonly var description = ref _slots[found].Description;
+            if (description.DccSliceSize is var sliceSize and not 0)
+            {
+                SynchronizeGuestDccMetadata(description.Metadata.Range.Address, sliceSize, request.View.BaseLayer, request.View.LayerCount);
+            }
+        }
+
+        return found;
+    }
+
+    private ResourceSlotIdentifier LookUpImage(ref ImageRequest request, bool exactFormat)
+    {
         using var held = _lock.Hold();
+        if (TryReuseLookup(ref request, exactFormat, out var reused))
+        {
+            return reused;
+        }
+
+        var original = request;
+        var generation = _lookupGeneration;
         var result = ResourceSlotIdentifier.Invalid;
         var candidates = FindImagesInRange(request.Description.Data.Address, request.Description.Data.Size, pageOverlap: false);
         foreach (var imageIdentifier in candidates)
@@ -131,6 +156,7 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
             }
         }
 
+        var sameBacking = result.IsValid;
         var viewMip = -1;
         var viewLayer = -1;
         if (!result.IsValid)
@@ -175,6 +201,12 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
                     ? GuestImageType.Color1D : GuestImageType.Color2D;
                 result = GrowImage(replacement, result);
             }
+            else if (request.Role == ImageRole.StorageImage && viewMip < 0 && viewLayer < 0 &&
+                     resolved.Description.IsBlock && !request.Description.IsBlock &&
+                     (resolved.Backing.Usage & ImageUsageFlags.StorageBit) == 0)
+            {
+                result = ReplaceCompressedForStorage(request.Description, result);
+            }
         }
 
         if (!result.IsValid)
@@ -211,6 +243,11 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
 
         image.LastAccessTick = _scheduler.CurrentTick;
         TouchImage(image);
+        if (sameBacking && generation == _lookupGeneration)
+        {
+            RememberLookup(original, exactFormat, request.View, result);
+        }
+
         return result;
     }
 
@@ -259,6 +296,7 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
         if (hasData)
         {
             RefreshFromGuest(imageIdentifier, request);
+            MergeMipTailBlock(image);
         }
 
         switch (request.Role)
@@ -311,7 +349,8 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
             var address = request.Description.Metadata.Range.Address;
             if (!_surfaceMetadata.TryGetValue(address, out var metadata))
             {
-                _surfaceMetadata.Add(address, new SurfaceMetadata { Kind = SurfaceMetadataKind.Dcc });
+                metadata = new SurfaceMetadata { Kind = SurfaceMetadataKind.Dcc };
+                _surfaceMetadata.Add(address, metadata);
             }
             else if (metadata.Kind == SurfaceMetadataKind.PendingDcc)
             {
@@ -321,6 +360,8 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
             {
                 throw SubmissionScheduler.Fatal($"A color target reuses metadata that is not DCC: address=0x{address:X16} kind={metadata.Kind}.");
             }
+
+            metadata.Size = Math.Max(metadata.Size, request.Description.DccSliceSize * request.Description.TransferLayers);
         }
 
         TakeGpuOwnership(image);
@@ -369,13 +410,88 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
             }
         }
 
-        TakeGpuOwnership(image);
         if (request.Description.HasStencil)
         {
-            AssociateStencilRange(imageIdentifier, request.Description.Stencil);
+            image.Description.Stencil = request.Description.Stencil;
+            RefreshStencilPlane(imageIdentifier, image, request.Description.Metadata.StencilCompressed);
         }
 
+        TakeGpuOwnership(image);
         return image.GetOrCreateView(request.View);
+    }
+
+    // GFX10 packs the mips smaller than half a swizzle block into one block at the start of the chain.
+    // A title can write that block through a single-level view the size of the block (Unity's
+    // screen-space reflection blur writes mips 3 and up that way), which the cache keeps as its own
+    // image; copy each tail mip out of it before the chain is read.
+    private void MergeMipTailBlock(CachedImage chain)
+    {
+        ref var description = ref chain.Description;
+        if (description.Resources.Levels <= 1 || description.IsBlock || description.IsDepth || description.Samples > 1 ||
+            description.Resources.Layers != 1 || description.IsVolume ||
+            !Agc.GnmTiling.TryGetBlockElementDimensions((uint)description.TileMode, (int)description.BytesPerBlock, out var blockWidth, out var blockHeight))
+        {
+            return;
+        }
+
+        foreach (var candidateIdentifier in FindImagesInRange(description.Data.Address, 1, pageOverlap: false))
+        {
+            var block = _slots[candidateIdentifier];
+            ref var blockDescription = ref block.Description;
+            if (ReferenceEquals(block, chain) || blockDescription.Data.Address != description.Data.Address ||
+                blockDescription.Resources.Levels != 1 || blockDescription.Resources.Layers != 1 ||
+                blockDescription.Extent.Width != (uint)blockWidth || blockDescription.Extent.Height != (uint)blockHeight ||
+                blockDescription.BytesPerBlock != description.BytesPerBlock || blockDescription.TileMode != description.TileMode ||
+                !block.IsGpuModified || !block.Backing.Exists || block.GpuWriteSequence <= chain.MergedTailSequence)
+            {
+                continue;
+            }
+
+            if (!Agc.GnmTiling.TryGetMipChainPlacement(
+                    (uint)description.TileMode,
+                    (int)description.Extent.Width,
+                    (int)description.Extent.Height,
+                    (int)description.BytesPerBlock,
+                    description.Resources.Levels,
+                    out var placements,
+                    out _))
+            {
+                return;
+            }
+
+            for (var mip = 0; mip < placements.Length && mip < chain.Backing.MipLevels; mip++)
+            {
+                var placement = placements[mip];
+                if (!placement.InMipTail ||
+                    placement.TailElementX + placement.ElementsWide > blockWidth ||
+                    placement.TailElementY + placement.ElementsHigh > blockHeight)
+                {
+                    continue;
+                }
+
+                chain.CopyRegionFrom(
+                    block,
+                    (uint)placement.TailElementX,
+                    (uint)placement.TailElementY,
+                    (uint)mip,
+                    (uint)placement.ElementsWide,
+                    (uint)placement.ElementsHigh);
+            }
+
+            chain.MergedTailSequence = block.GpuWriteSequence;
+            return;
+        }
+    }
+
+    private void RefreshStencilPlane(ResourceSlotIdentifier depthIdentifier, CachedImage depth, bool stencilCompressed)
+    {
+        var association = AssociateStencilRange(depthIdentifier, depth.Description.Stencil);
+        if (stencilCompressed || depth.Description.Samples != 1)
+        {
+            return;
+        }
+
+        RefreshFromGuest(association, RefreshRequest(_slots[association]));
     }
 
     public void MarkGpuWritten(ResourceSlotIdentifier imageIdentifier)
@@ -389,13 +505,24 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
 
         WatchImage(imageIdentifier);
         TakeGpuOwnership(image);
+        if (image.Description.HasStencil)
+        {
+            TakeStencilOwnership(imageIdentifier, image);
+        }
+    }
+
+    private void TakeStencilOwnership(ResourceSlotIdentifier depthIdentifier, CachedImage depth)
+    {
+        var association = AssociateStencilRange(depthIdentifier, depth.Description.Stencil);
+        WatchImage(association);
+        TakeGpuOwnership(_slots[association]);
     }
 
     private static void TakeGpuOwnership(CachedImage image)
     {
-        if (image.DepthOwner.IsValid || !image.Backing.Exists)
+        if (!image.DepthOwner.IsValid && !image.Backing.Exists)
         {
-            throw SubmissionScheduler.Fatal($"A stencil association cannot own image contents: address=0x{image.Description.Data.Address:X16}.");
+            throw SubmissionScheduler.Fatal($"GPU ownership needs a native image or a stencil association: address=0x{image.Description.Data.Address:X16}.");
         }
 
         image.ClearBufferModified();
@@ -463,7 +590,7 @@ public sealed unsafe partial class GuestImageCache : IGuestImageCache, IGuestIma
     private ResourceSlotIdentifier InsertImage(in ImageDescription description)
     {
         using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.ImageCreate);
-        var imageIdentifier = _slots.Insert(new CachedImage(_device, _scheduler, _backing, description));
+        var imageIdentifier = _slots.Insert(new CachedImage(_device, _scheduler, _backing, description, _backingPool));
         if (!ImageDescription.IsEmptyRange(description.Data))
         {
             AddToIndex(imageIdentifier);

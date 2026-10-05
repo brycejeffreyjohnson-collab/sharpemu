@@ -129,6 +129,11 @@ public sealed partial class RenderExecutor
     }
 
     // A written buffer resource with an address and a footprint needs a barrier after the stage.
+    // Device-address accesses are not split into reads and writes, so they count as stores.
+    private bool DrawWritesMemory(ShaderStageResources stage) =>
+        stage.Program is { } program &&
+        (program.UsesDeviceAddresses || WritesStorageImage(program) || HasBufferWrites(stage));
+
     private bool HasBufferWrites(ShaderStageResources stage)
     {
         var program = stage.Program ?? throw _host.Fatal("A shader stage has no program.");
@@ -220,6 +225,10 @@ public sealed partial class RenderExecutor
 
         var vertexBuffers = AcquireVertexBuffers(vertexInput);
         var indexBuffer = AcquireIndexBuffer(in indexSource);
+        var indirectArguments = emission.IndirectArgumentsAddress != 0
+            ? _host.ObtainBuffer(emission.IndirectArgumentsAddress, IndexedIndirectArgumentsSize, isWritten: false)
+            : default;
+        DropUnwrittenColorTargets(context, ref state, pixelProgram);
         state.Rendering = AcquireAttachments(ref state);
         // Nothing after the pipeline touches guest memory.
         var pipeline = _pipelines.CreateGraphicsPipeline(
@@ -264,6 +273,11 @@ public sealed partial class RenderExecutor
             SetDrawDebugPhase(submitId, in draw, 0x400);
         }
 
+        if (DrawWritesMemory(vertexInput.Stage) || (pixelBindings is not null && DrawWritesMemory(pixelInput.Stage)))
+        {
+            _host.PrepareMemoryWritingDraw();
+        }
+
         _host.BeginRendering(in state.Rendering);
         _host.BindPipeline(PipelineBindPoint.Graphics, in pipeline);
         if (setAutoDebug)
@@ -271,7 +285,16 @@ public sealed partial class RenderExecutor
             SetDrawDebugPhase(submitId, in draw, 0x500);
         }
 
-        EmitDraw(banks.UserConfig, vertexInput, in draw, in emission);
+        if (emission.IndirectArgumentsAddress != 0)
+        {
+            // Uploads and shader writes end with barriers to all commands, so the
+            // indirect read sees them.
+            _host.DrawIndexedIndirect(indirectArguments);
+        }
+        else
+        {
+            EmitDraw(banks.UserConfig, vertexInput, in draw, in emission);
+        }
         if (setAutoDebug)
         {
             SetDrawDebugPhase(submitId, in draw, 0x600);
@@ -299,6 +322,8 @@ public sealed partial class RenderExecutor
             SetDrawDebugPhase(submitId, in draw, 0x700);
         }
     }
+
+    private const ulong IndexedIndirectArgumentsSize = 20;
 
     private void EmitDraw(UserConfigRegisters userConfig, VertexInputInfo vertexInput, in DrawCall draw, in DrawEmission emission)
     {

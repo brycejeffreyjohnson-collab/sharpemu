@@ -9,6 +9,8 @@ public enum CommandSubmissionKind
     Compute,
     // A video-out export flip queued behind the graphics submissions before it.
     FlipPreparation,
+    // A suspend point queued behind the graphics submissions of the frame it ends.
+    FrameBoundary,
 }
 
 public enum SubmissionProgress
@@ -109,6 +111,8 @@ public sealed class CommandSubmission
     public ulong FlipRequestId { get; init; }
 
     public PacketCursorStack Commands { get; } = new();
+
+    // Its place in the order every queue was fed; the frame run-ahead waits by it.
 
     public bool ResetInterpreter { get; internal set; }
 

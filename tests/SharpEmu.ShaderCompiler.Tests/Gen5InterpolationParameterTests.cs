@@ -99,12 +99,159 @@ public sealed class Gen5InterpolationParameterTests
     [Theory]
     [InlineData(0u)]
     [InlineData(1u)]
-    public void VertexDifferenceMove_KeepsPerVertexInputWithoutPerVertexSupport(uint selector)
+    public void VertexDifferenceMove_FallsBackToInterpolatedInputWithoutPerVertexSupport(uint selector)
     {
         var request = Request(selector, false, inputCntl: 0x1, supportsPerVertex: false);
         Assert.True(Gen5SpirvTranslator.TryCompileProgram(request, out var shader, out var error), error);
-        Assert.Contains(Instructions(shader.Spirv), instruction => instruction.Opcode == SpirvOp.Decorate &&
+        var instructions = Instructions(shader.Spirv);
+        Assert.DoesNotContain(instructions, instruction => instruction.Opcode == SpirvOp.Capability &&
+            instruction.Operands[0] == (uint)SpirvCapability.FragmentBarycentricKhr);
+        Assert.DoesNotContain(instructions, instruction => instruction.Opcode == SpirvOp.Decorate &&
             instruction.Operands[1] == (uint)SpirvDecoration.PerVertexKhr);
+        Assert.DoesNotContain(instructions, instruction => instruction.Opcode == SpirvOp.Decorate &&
+            instruction.Operands[1] == (uint)SpirvDecoration.Flat);
+        ValidateWhenAvailable(shader.Spirv);
+    }
+
+    [Fact]
+    public void PixelSystemInputs_ReadTheirBuiltIns()
+    {
+        Assert.True(Gen5SpirvTranslator.TryCompileProgram(
+            Request(0, false, inputs: 0xF002, opcode: "VInterpP2F32"), out var shader, out var error), error);
+        var instructions = Instructions(shader.Spirv);
+        var builtIns = instructions
+            .Where(instruction => instruction.Opcode == SpirvOp.Decorate &&
+                instruction.Operands[1] == (uint)SpirvDecoration.BuiltIn)
+            .Select(instruction => instruction.Operands[2]).ToArray();
+        Assert.Contains((uint)SpirvBuiltIn.FrontFacing, builtIns);
+        Assert.Contains((uint)SpirvBuiltIn.Layer, builtIns);
+        Assert.Contains((uint)SpirvBuiltIn.SampleMask, builtIns);
+        Assert.Contains(instructions, instruction => instruction.Opcode == SpirvOp.ShiftLeftLogical);
+        ValidateWhenAvailable(shader.Spirv);
+    }
+
+    [Fact]
+    public void SlotsReadingOneParameter_ShareOneInput()
+    {
+        // PS slots 1 and 2 both read VS parameter 1; the second slot must not move to a
+        // location the vertex program never writes.
+        Gen5ShaderInstruction Move(uint pc, uint attribute, uint destination) =>
+            new(pc, Gen5ShaderEncoding.Vintrp, "VInterpMovF32",
+                [1], [Gen5Operand.Vector(1)], [Gen5Operand.Vector(destination)], new Gen5InterpolationControl(attribute, 0));
+        var program = ResourceTestProgram.Program(Move(0, 1, 4), Move(4, 2, 5), ResourceTestProgram.EndProgram(8));
+        var (plan, resources, layout) = ResourceTestProgram.Prepare(program, ShaderStage.Pixel, userDataCount: 0);
+        var request = new ShaderCompileRequest(plan, resources, layout)
+        {
+            PixelInputAddress = 2,
+            PixelInputEnable = 2,
+            PixelInputCntl = [0, 0x1, 0x1],
+            PixelCustomInterpolationMask = 6,
+            SupportsPerVertexPixelInputs = true,
+        };
+        Assert.True(Gen5SpirvTranslator.TryCompileProgram(request, out var shader, out var error), error);
+        var instructions = Instructions(shader.Spirv);
+        var input = Assert.Single(instructions, instruction => instruction.Opcode == SpirvOp.Decorate &&
+            instruction.Operands[1] == (uint)SpirvDecoration.PerVertexKhr).Operands[0];
+        var location = Assert.Single(instructions, instruction => instruction.Opcode == SpirvOp.Decorate &&
+            instruction.Operands[0] == input && instruction.Operands[1] == (uint)SpirvDecoration.Location);
+        Assert.Equal(1u, location.Operands[2]);
+        Assert.Equal(2, instructions.Count(instruction => instruction.Opcode == SpirvOp.AccessChain &&
+            instruction.Operands[2] == input));
+        ValidateWhenAvailable(shader.Spirv);
+    }
+
+    [Fact]
+    public void SmoothSlotSharingAPerVertexParameter_InterpolatesThePerVertexInput()
+    {
+        // Slot 1 is read per vertex, slot 2 interpolates the same VS parameter: one per-vertex
+        // input serves both, and slot 2 is rebuilt from the vertices with the barycentrics.
+        var move = new Gen5ShaderInstruction(0, Gen5ShaderEncoding.Vintrp, "VInterpMovF32",
+            [1], [Gen5Operand.Vector(1)], [Gen5Operand.Vector(4)], new Gen5InterpolationControl(1, 0));
+        var smooth = new Gen5ShaderInstruction(4, Gen5ShaderEncoding.Vintrp, "VInterpP2F32",
+            [0], [Gen5Operand.Vector(1)], [Gen5Operand.Vector(5)], new Gen5InterpolationControl(2, 0));
+        var program = ResourceTestProgram.Program(move, smooth, ResourceTestProgram.EndProgram(8));
+        var (plan, resources, layout) = ResourceTestProgram.Prepare(program, ShaderStage.Pixel, userDataCount: 0);
+        var request = new ShaderCompileRequest(plan, resources, layout)
+        {
+            PixelInputAddress = 2,
+            PixelInputEnable = 2,
+            PixelInputCntl = [0, 0x1, 0x1],
+            PixelCustomInterpolationMask = 2,
+            SupportsPerVertexPixelInputs = true,
+        };
+        Assert.True(Gen5SpirvTranslator.TryCompileProgram(request, out var shader, out var error), error);
+        var instructions = Instructions(shader.Spirv);
+        var input = Assert.Single(instructions, instruction => instruction.Opcode == SpirvOp.Decorate &&
+            instruction.Operands[1] == (uint)SpirvDecoration.PerVertexKhr).Operands[0];
+        var inputLocations = instructions.Where(instruction => instruction.Opcode == SpirvOp.Decorate &&
+            instruction.Operands[1] == (uint)SpirvDecoration.Location && instruction.Operands[0] == input).ToArray();
+        Assert.Equal(1u, Assert.Single(inputLocations).Operands[2]);
+        Assert.Contains(instructions, instruction => instruction.Opcode == SpirvOp.Decorate &&
+            instruction.Operands[1] == (uint)SpirvDecoration.BuiltIn && instruction.Operands[2] == (uint)SpirvBuiltIn.BaryCoordKhr);
+        Assert.Equal(4, instructions.Count(instruction => instruction.Opcode == SpirvOp.AccessChain &&
+            instruction.Operands[2] == input));
+        ValidateWhenAvailable(shader.Spirv);
+    }
+
+    [Theory]
+    [InlineData(0x800u, 1)]
+    [InlineData(0x400u, 0)]
+    public void PositionW_IsTheReciprocalOfTheFragmentCoordinate(uint inputs, int reciprocals)
+    {
+        var program = ResourceTestProgram.Program(ResourceTestProgram.EndProgram(0));
+        var (plan, resources, layout) = ResourceTestProgram.Prepare(program, ShaderStage.Pixel, userDataCount: 0);
+        var request = new ShaderCompileRequest(plan, resources, layout) { PixelInputAddress = inputs, PixelInputEnable = inputs };
+        Assert.True(Gen5SpirvTranslator.TryCompileProgram(request, out var shader, out var error), error);
+        var instructions = Instructions(shader.Spirv);
+        var position = Assert.Single(instructions, instruction => instruction.Opcode == SpirvOp.Decorate &&
+            instruction.Operands[1] == (uint)SpirvDecoration.BuiltIn && instruction.Operands[2] == (uint)SpirvBuiltIn.FragCoord).Operands[0];
+        var loaded = instructions.Where(instruction => instruction.Opcode == SpirvOp.Load && instruction.Operands[2] == position)
+            .Select(instruction => instruction.Operands[1]).ToHashSet();
+        var w = instructions.Where(instruction => instruction.Opcode == SpirvOp.CompositeExtract &&
+            loaded.Contains(instruction.Operands[2]) && instruction.Operands[3] == 3).Select(instruction => instruction.Operands[1]).ToHashSet();
+        Assert.Equal(reciprocals, instructions.Count(instruction => instruction.Opcode == SpirvOp.FDiv && w.Contains(instruction.Operands[3])));
+        ValidateWhenAvailable(shader.Spirv);
+    }
+
+    [Theory]
+    [InlineData(ShaderStage.Pixel, 32u)]
+    [InlineData(ShaderStage.Pixel, 64u)]
+    [InlineData(ShaderStage.Vertex, 32u)]
+    [InlineData(ShaderStage.Vertex, 64u)]
+    public void LaneSpills_AreReadBackWithoutTheHostSubgroup(ShaderStage stage, uint waveSize)
+    {
+        var program = ResourceTestProgram.Program(
+            ResourceTestProgram.WriteLane(0, vectorRegister: 18, scalarRegister: 84, lane: 5),
+            ResourceTestProgram.WriteLane(8, vectorRegister: 18, scalarRegister: 85, lane: 37),
+            ResourceTestProgram.ReadLane(16, scalarRegister: 86, vectorRegister: 18, lane: 5),
+            ResourceTestProgram.ReadLane(24, scalarRegister: 87, vectorRegister: 18, lane: 37),
+            ResourceTestProgram.EndProgram(32));
+        var (plan, resources, layout) = ResourceTestProgram.Prepare(program, stage, userDataCount: 0);
+        var request = new ShaderCompileRequest(plan, resources, layout) { WaveSize = waveSize, EnableGraphicsSubgroupOperations = true };
+        Assert.True(Gen5SpirvTranslator.TryCompileProgram(request, out var shader, out var error), error);
+        Assert.DoesNotContain(Instructions(shader.Spirv), instruction => instruction.Opcode == SpirvOp.GroupNonUniformBroadcast);
+        var text = System.Text.Encoding.ASCII.GetString(shader.Spirv);
+        Assert.Contains("v18_lane5", text, StringComparison.Ordinal);
+        Assert.Contains("v18_lane37", text, StringComparison.Ordinal);
+        ValidateWhenAvailable(shader.Spirv);
+    }
+
+    [Theory]
+    [InlineData(ShaderStage.Pixel, 0)]
+    [InlineData(ShaderStage.Vertex, 0)]
+    [InlineData(ShaderStage.Compute, 2)]
+    public void ReadlaneOfAnUnspilledLane_UsesTheHostSubgroupOnlyInCompute(ShaderStage stage, int broadcasts)
+    {
+        var program = ResourceTestProgram.Program(
+            ResourceTestProgram.WriteLane(0, vectorRegister: 18, scalarRegister: 84, lane: 5),
+            ResourceTestProgram.ReadLane(8, scalarRegister: 86, vectorRegister: 18, lane: 6),
+            ResourceTestProgram.ReadLane(16, scalarRegister: 87, vectorRegister: 19, lane: 5),
+            ResourceTestProgram.EndProgram(24));
+        var (plan, resources, layout) = ResourceTestProgram.Prepare(program, stage, userDataCount: 0);
+        var request = new ShaderCompileRequest(plan, resources, layout) { WaveSize = 32, EnableGraphicsSubgroupOperations = true };
+        Assert.True(Gen5SpirvTranslator.TryCompileProgram(request, out var shader, out var error), error);
+        Assert.Equal(broadcasts, Instructions(shader.Spirv).Count(instruction => instruction.Opcode == SpirvOp.GroupNonUniformBroadcast));
+        ValidateWhenAvailable(shader.Spirv);
     }
 
     private static ShaderCompileRequest Request(

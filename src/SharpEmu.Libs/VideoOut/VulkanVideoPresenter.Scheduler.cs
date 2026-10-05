@@ -40,6 +40,17 @@ internal static unsafe partial class VulkanVideoPresenter
             EndRendering();
         }
 
+        bool IRenderingState.TryDeferUntilRenderingEnds(PipelineStageFlags sourceStages, PipelineStageFlags destinationStages, List<ImageMemoryBarrier2> barriers)
+        {
+            if (!_renderingActive)
+            {
+                return false;
+            }
+
+            _barriersAfterRendering.Add((sourceStages, destinationStages, barriers.ToArray()));
+            return true;
+        }
+
         internal static void WakeRenderThread()
         {
             SubmissionFlowProfile.Record(SubmissionFlowProfile.EventKind.WakeRequested);
@@ -80,6 +91,10 @@ internal static unsafe partial class VulkanVideoPresenter
             _guestBacking = backing;
             _bufferCache = new GuestBufferCache(_deviceInfo, _scheduler, _relay, memory.Pages, guest, backing);
             _bufferCache.StreamOffsetAlignment = Math.Max(_bufferCache.StreamOffsetAlignment, GuestStorageBufferOffsetAlignment);
+            if (_readbackQueueFamilyIndex is { } readbackFamily)
+            {
+                _bufferCache.AsyncReadback = new Gpu.Vulkan.VulkanAsyncReadback(_deviceInfo, _scheduler, _readbackQueue, readbackFamily);
+            }
         }
 
         // The image store follows the buffer store; readback of linear images stays off.

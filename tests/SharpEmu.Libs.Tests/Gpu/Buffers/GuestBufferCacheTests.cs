@@ -24,6 +24,22 @@ public sealed class GuestBufferCacheTests : IClassFixture<HeadlessVulkanFixture>
     private const ulong Page = GuestBufferCache.CachingPageSize;
 
     [Fact]
+    public void UnalignedImageObtainUploadsTheWholeDirtyPageToItsBufferOwner()
+    {
+        if (!GatePrerequisites.Ready(_vulkan)) return;
+        using var harness = new CacheHarness(_vulkan);
+        var address = harness.MapBacked(0x10000, ReadWrite);
+        var owner = harness.Worker.Run(() =>
+            harness.Cache.GetBuffer(harness.Cache.FindBuffer(address, Page)));
+        var expected = Pattern(0x1000, 37);
+        harness.Write(address, expected);
+        var source = harness.Worker.Run(() => harness.Cache.ObtainBufferForImage(address + 17, 64));
+        Assert.Same(owner, source.Buffer);
+        Assert.Equal(expected, harness.ReadBack(owner, owner.Offset(address), 0x1000));
+        harness.Shutdown();
+    }
+
+    [Fact]
     public void ImageUploadFailureIdentifiesAHoleBetweenBackedEndpoints()
     {
         if (_vulkan is null) return;
@@ -86,6 +102,43 @@ public sealed class GuestBufferCacheTests : IClassFixture<HeadlessVulkanFixture>
         });
         Assert.True(harness.Cache.TrySynchronizeCpuRead(address, 4));
         Assert.Equal(new byte[] { 0x78, 0x56, 0x34, 0x12 }, harness.Read(address, 4));
+    }
+
+    [Fact]
+    public void AHostWordCopyRepeatsTheSourceAndReachesARegisteredBuffer()
+    {
+        if (_vulkan is null) return;
+        using var harness = new CacheHarness(_vulkan);
+        var address = harness.MapBacked(Page, ReadWrite);
+        var destination = address + 0x100;
+        harness.Write(address, Bytes(1u, 2u, 3u));
+        var (before, beforeOffset) = harness.Worker.Run(() => harness.Cache.ObtainBuffer(destination, 28, isWritten: false));
+        Assert.Equal(new byte[28], harness.ReadBack(before, beforeOffset, 28));
+
+        Assert.True(harness.Worker.Run(() => harness.Cache.TryCopyWordsOnHost(destination, address, 3, 7)));
+
+        var expected = Bytes(1u, 2u, 3u, 1u, 2u, 3u, 1u);
+        Assert.Equal(expected, harness.Read(destination, 28));
+        Assert.False(harness.Cache.HasGpuDirtyBytes(destination, 28));
+        var (buffer, offset) = harness.Worker.Run(() => harness.Cache.ObtainBuffer(destination, 28, isWritten: false));
+        Assert.Equal(expected, harness.ReadBack(buffer, offset, 28));
+        harness.Shutdown();
+    }
+
+    [Fact]
+    public void AHostWordCopyIsRefusedForGpuWrittenOrOverlappingRanges()
+    {
+        if (_vulkan is null) return;
+        using var harness = new CacheHarness(_vulkan);
+        var address = harness.MapBacked(Page, ReadWrite);
+        harness.Write(address, Bytes(1u, 2u, 3u, 4u));
+
+        Assert.False(harness.Worker.Run(() => harness.Cache.TryCopyWordsOnHost(address + 8, address, 4, 4)));
+        harness.Worker.Run(() => harness.Cache.ObtainBuffer(address + 0x200, 4, isWritten: true));
+        Assert.False(harness.Worker.Run(() => harness.Cache.TryCopyWordsOnHost(address + 0x100, address + 0x200, 1, 1)));
+        Assert.False(harness.Worker.Run(() => harness.Cache.TryCopyWordsOnHost(address + 0x200, address, 1, 1)));
+        Assert.True(harness.Worker.Run(() => harness.Cache.TryCopyWordsOnHost(address + 0x100, address, 4, 4)));
+        harness.Shutdown();
     }
 
     [Theory]

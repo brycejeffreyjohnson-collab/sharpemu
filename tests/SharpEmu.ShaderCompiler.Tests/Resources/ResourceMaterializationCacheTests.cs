@@ -109,6 +109,27 @@ public sealed class ResourceMaterializationCacheTests
     }
 
     [Fact]
+    public void AlternatingDescriptorsReuseEveryRecentVariant()
+    {
+        var plan = Plan();
+        var heap = new Heap();
+        var cache = new ResourceMaterializationCache();
+        var word = HeapBase + 0x100 + 5 * 32;
+        Assert.True(Run(cache, plan, heap, [0x1000, 0], out var first, out _));
+        heap.Words[word] = 0x3000;
+        Assert.True(Run(cache, plan, heap, [0x1000, 0], out var second, out _));
+        Assert.Equal((0, 2), (cache.Hits, cache.Misses));
+
+        heap.Words[word] = 0x1000;
+        Assert.True(Run(cache, plan, heap, [0x1000, 0], out var firstAgain, out _));
+        heap.Words[word] = 0x3000;
+        Assert.True(Run(cache, plan, heap, [0x1000, 0], out var secondAgain, out _));
+        Assert.Same(first, firstAgain);
+        Assert.Same(second, secondAgain);
+        Assert.Equal((2, 2), (cache.Hits, cache.Misses));
+    }
+
+    [Fact]
     public void AChangedMaskMaterializesAgain()
     {
         var plan = Plan();
@@ -158,6 +179,89 @@ public sealed class ResourceMaterializationCacheTests
         Assert.Equal(ok, Run(cache, plan, heap, [0x1000, 0], out _, out _));
         Assert.True(heap.Reads > reads);
         Assert.Equal(0, cache.Hits);
+    }
+
+    [Fact]
+    public void AFailedRecordingDoesNotPoisonTheNextReader()
+    {
+        var plan = Plan();
+        var incomplete = new Heap();
+        incomplete.Words.Remove(HeapBase + 0x100 + 5 * 32 + 4);
+        var cache = new ResourceMaterializationCache();
+        Run(cache, plan, incomplete, [0x1000, 0], out _, out _);
+
+        var complete = new Heap();
+        Assert.True(Run(cache, plan, complete, [0x1000, 0], out var first, out _));
+        Assert.True(Run(cache, plan, complete, [0x1000, 0], out var second, out _));
+        Assert.Same(first, second);
+        Assert.Equal(1, cache.Hits);
+
+        // Retained entries must not refer to scratch reads reused for another key.
+        complete.Words[HeapBase + 0x80] = 1u << 1;
+        Assert.True(Run(cache, plan, complete, [0x1000, 0], out _, out _, shaderBase: 0x100));
+        var original = new Heap();
+        Assert.True(Run(cache, plan, original, [0x1000, 0], out var restored, out _));
+        Assert.Same(first, restored);
+    }
+
+    // The table pointer in s[0:1]; the rest of the nine user-data registers the program declares.
+    private static readonly uint[] TableUserData = [0x1000, 0, 0, 0, 0, 0, 0, 0, 0];
+
+    // Reads the four constants of FlattenedReadReuseTests.RepeatedReadProgram from a word memory.
+    private static bool RunTable(ResourceMaterializationCache cache, ShaderResourcePlan plan, TestWordMemory memory,
+        out ResourceSnapshot snapshot)
+    {
+        snapshot = new ResourceSnapshot();
+        var specialization = new ResourceSpecialization();
+        return cache.Materialize(plan, Inputs(TableUserData, memory.Read, memory.Read), (address, destination, _) =>
+        {
+            for (var offset = 0; offset < destination.Length; offset += 4)
+            {
+                if (!memory.Read(address + (ulong)offset, out var word))
+                    return false;
+                BitConverter.TryWriteBytes(destination[offset..], word);
+            }
+
+            return true;
+        }, ref snapshot, ref specialization, out _);
+    }
+
+    [Fact]
+    public void AChangedTableOnlyWordRefreshesOnlyTheTable()
+    {
+        var (plan, _, _) = Prepare(FlattenedReadReuseTests.RepeatedReadProgram(4), userDataCount: 9);
+        var memory = new TestWordMemory { Words = [11, 22, 33, 44] };
+        var cache = new ResourceMaterializationCache();
+        Assert.True(RunTable(cache, plan, memory, out var first));
+        Assert.Equal([11u, 22, 33, 44], first.FlattenedResourceTable);
+
+        memory.Words[2] = 99;
+        Assert.True(RunTable(cache, plan, memory, out var second));
+        Assert.Equal((0, 1, 1), (cache.Hits, cache.Misses, cache.TableRefreshes));
+        Assert.Equal([11u, 22, 99, 44], second.FlattenedResourceTable);
+        Assert.Same(first.Buffers, second.Buffers);
+
+        // The refreshed table matches an uncached full walk, and the refreshed entry is then a hit.
+        var reference = new ResourceSnapshot();
+        var referenceSpecialization = new ResourceSpecialization();
+        Assert.True(ResourceMaterializer.Materialize(plan, Inputs(TableUserData, memory.Read, memory.Read), ref reference, ref referenceSpecialization));
+        Assert.Equal(reference.FlattenedResourceTable, second.FlattenedResourceTable);
+        Assert.True(RunTable(cache, plan, memory, out var third));
+        Assert.Same(second, third);
+        Assert.Equal((1, 1, 1), (cache.Hits, cache.Misses, cache.TableRefreshes));
+    }
+
+    [Fact]
+    public void AnUnreadableTableWordFallsBackToAFullWalk()
+    {
+        var (plan, _, _) = Prepare(FlattenedReadReuseTests.RepeatedReadProgram(4), userDataCount: 9);
+        var memory = new TestWordMemory { Words = [11, 22, 33, 44] };
+        var cache = new ResourceMaterializationCache();
+        Assert.True(RunTable(cache, plan, memory, out _));
+        memory.Words[1] = 7;
+        memory.FailAddress = 0x1000 + 3 * 4;
+        RunTable(cache, plan, memory, out _);
+        Assert.Equal(0, cache.TableRefreshes);
     }
 
     [Fact]

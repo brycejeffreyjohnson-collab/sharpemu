@@ -33,6 +33,8 @@ internal sealed class RecordingCommandStreamHost : ICommandStreamHost
 
     public List<ulong> GuestReads { get; } = new();
 
+    public Action<ulong>? BeforeGuestRead { get; set; }
+
     public List<DrawIndexedArguments> IndexedDraws { get; } = new();
 
     public List<DrawAutoArguments> AutoDraws { get; } = new();
@@ -55,6 +57,7 @@ internal sealed class RecordingCommandStreamHost : ICommandStreamHost
     public bool TryReadGuest(ulong address, Span<byte> destination)
     {
         GuestReads.Add(address);
+        BeforeGuestRead?.Invoke(address);
         if (PendingGpuValues.Remove(address, out var pending))
         {
             WriteQword(address, pending);
@@ -169,7 +172,13 @@ internal sealed class RecordingCommandStreamHost : ICommandStreamHost
     }
 
     public void DispatchDirect(ulong submitId, uint groupsX, uint groupsY, uint groupsZ, uint dispatchInitiator, ulong indirectArgumentsAddress = 0) =>
-        Calls.Add($"dispatch {submitId} {groupsX} {groupsY} {groupsZ} {dispatchInitiator:X}");
+        Calls.Add(indirectArgumentsAddress == 0
+            ? $"dispatch {submitId} {groupsX} {groupsY} {groupsZ} {dispatchInitiator:X}"
+            : $"dispatch {submitId} {groupsX} {groupsY} {groupsZ} {dispatchInitiator:X} @{indirectArgumentsAddress:X}");
+
+    public bool ResolvesIndirectDispatchOnGpu { get; set; }
+
+    public bool ResolvesIndirectDrawOnGpu { get; set; }
 
     public void OnQueueReset(int queueId) => Calls.Add($"queue_reset {queueId}");
 

@@ -68,6 +68,7 @@ public sealed class GpuCommandInterpreterLabelTests
     [InlineData(0x04u, 5u, 0x00u, 0u, EndOfPipeWriteKind.Write64)]
     [InlineData(0x14u, 0u, 0x38u, 0u, EndOfPipeWriteKind.WriteBack64)]
     [InlineData(0x2Fu, 0u, 0x00u, 0u, EndOfPipeWriteKind.Write64)]
+    [InlineData(0x2Fu, 0u, 0x00u, 2u, EndOfPipeWriteKind.Interrupt64)]
     [InlineData(0x04u, 5u, 0x3Bu, 2u, EndOfPipeWriteKind.InterruptWriteBack64)]
     [InlineData(0x28u, 0u, 0x38u, 2u, EndOfPipeWriteKind.InterruptWriteBack64)]
     public void EndOfPipeWrite64_AcceptedCombinations(uint eventType, uint eventIndex, uint cacheAction, uint interruptSelector, EndOfPipeWriteKind expected)
@@ -81,7 +82,7 @@ public sealed class GpuCommandInterpreterLabelTests
     }
 
     [Theory]
-    [InlineData(0x2Fu, 0u, 0x00u, 2u)]
+    [InlineData(0x2Fu, 5u, 0x00u, 2u)]
     [InlineData(0x04u, 0u, 0x00u, 0u)]
     [InlineData(0x2Fu, 6u, 0x38u, 2u)]
     public void EndOfPipeWrite64_RejectedCombinations(uint eventType, uint eventIndex, uint cacheAction, uint interruptSelector)
@@ -166,18 +167,21 @@ public sealed class GpuCommandInterpreterLabelTests
         Assert.Equal(0x22u, runner.Host.ReadDword(Label + 4));
     }
 
+    // Release-memory packets leave their completions in the recording buffer; the
+    // command stream queue submits it when the slice ends or blocks (see
+    // CommandStreamQueueTests), so none of these expect a per-packet flush.
     [Fact]
-    public void ReleaseMemoryNative_DataSelectionOne_WritesFlushesAndFollowsTheGcrBarrierRule()
+    public void ReleaseMemoryNative_DataSelectionOne_WritesAndFollowsTheGcrBarrierRule()
     {
         var runner = new StreamRunner();
 
         runner.Run(ReleaseMemoryNative(0x28, 5, 0, 0, 1, 0, Label, 0x77, 0));
-        Assert.Equal(new[] { "eop Write32", "flush" }, runner.Host.Calls);
+        Assert.Equal(new[] { "eop Write32" }, runner.Host.Calls);
         Assert.Equal(0x77u, runner.Host.ReadDword(Label));
 
         runner.Host.Calls.Clear();
         runner.Run(ReleaseMemoryNative(0x28, 5, 1u << 9, 0, 1, 2, Label, 0x78, 9));
-        Assert.Equal(new[] { "barrier", "eop InterruptWriteBack32", "flush" }, runner.Host.Calls);
+        Assert.Equal(new[] { "barrier", "eop InterruptWriteBack32" }, runner.Host.Calls);
         Assert.Equal(9u, runner.Host.EndOfPipeWrites[^1].ContextId);
     }
 
@@ -188,16 +192,16 @@ public sealed class GpuCommandInterpreterLabelTests
         runner.Host.WriteDword(Label, 5);
 
         runner.Run(ReleaseMemoryNative(0x28, 5, 0, 0, 0, 2, Label, 1, 0));
-        Assert.Equal(new[] { "eop InterruptOnly", "flush" }, runner.Host.Calls);
+        Assert.Equal(new[] { "eop InterruptOnly" }, runner.Host.Calls);
 
         runner.Host.Calls.Clear();
         runner.Run(ReleaseMemoryNative(0x04, 5, 0, 0, 1, 4, Label, 1, 0));
-        Assert.Equal(new[] { "barrier", "eop InterruptOnly", "flush" }, runner.Host.Calls);
+        Assert.Equal(new[] { "barrier", "eop InterruptOnly" }, runner.Host.Calls);
         Assert.Equal(5u, runner.Host.ReadDword(Label));
 
         runner.Host.Calls.Clear();
         runner.Run(ReleaseMemoryNative(0x28, 5, 0, 0, 1, 3, Label, 1, 0));
-        Assert.Equal(new[] { "eop Write32", "flush" }, runner.Host.Calls);
+        Assert.Equal(new[] { "eop Write32" }, runner.Host.Calls);
         Assert.Equal(1u, runner.Host.ReadDword(Label));
     }
 
@@ -216,14 +220,39 @@ public sealed class GpuCommandInterpreterLabelTests
         Assert.Equal(EndOfPipeWriteKind.ClockWrite, runner.Host.EndOfPipeWrites[^1].Kind);
     }
 
+    [Theory]
+    [InlineData(false, 0)]
+    [InlineData(true, 0)]
+    [InlineData(false, 3)]
+    [InlineData(true, 3)]
+    public void ReleaseMemory_ComputeDoneWrites64BitsAndDefersTheInterrupt(bool wrapped, int queueId)
+    {
+        var runner = new StreamRunner(queueId);
+        const ulong value = 0x1122_3344_5566_7788;
+        const uint contextId = 9;
+
+        runner.Run(wrapped
+            ? ReleaseMemoryWrapped(0x2F, 0, 2, 2, Label, value, contextId)
+            : ReleaseMemoryNative(0x2F, 6, 0, 0, 2, 2, Label, value, contextId));
+
+        Assert.Equal(value, runner.Host.ReadQword(Label));
+        var write = Assert.Single(runner.Host.EndOfPipeWrites);
+        Assert.Equal(EndOfPipeWriteKind.Interrupt64, write.Kind);
+        Assert.Equal(Label, write.Destination);
+        Assert.Equal(value, write.Value);
+        Assert.Equal(contextId, write.ContextId);
+        Assert.Equal(runner.Interpreter.InterruptEventId, write.EventId);
+        Assert.Equal(new[] { "barrier", "eop Interrupt64" }, runner.Host.Calls);
+    }
+
     [Fact]
-    public void ReleaseMemoryNative_GdsSelectionFlushesOnlyForSelectorOne()
+    public void ReleaseMemoryNative_GdsSelectionInterruptsOnlyForSelectorOne()
     {
         var runner = new StreamRunner(queueId: 2);
         runner.Host.Gds[0] = 0x42;
 
         runner.Run(ReleaseMemoryNative(0x28, 5, 0, 0, 5, 1, Label, 1u << 16, 0));
-        Assert.Equal(new[] { "synchronize", "read_gds 0 1", "eop GdsWrite32", $"interrupt {GpuCommandInterpreter.ComputeQueueBase + 1} 0", "flush" }, runner.Host.Calls);
+        Assert.Equal(new[] { "synchronize", "read_gds 0 1", "eop GdsWrite32", $"interrupt {GpuCommandInterpreter.ComputeQueueBase + 1} 0" }, runner.Host.Calls);
 
         runner.Host.Calls.Clear();
         runner.Run(ReleaseMemoryNative(0x28, 5, 0, 0, 5, 0, Label, 1u << 16, 0));
@@ -253,7 +282,7 @@ public sealed class GpuCommandInterpreterLabelTests
         runner.Host.Calls.Clear();
         runner.Run(ReleaseMemoryWrapped(0x2F, 1u << 9, 1, 0, Label, 0x9, 0));
         Assert.Equal(0x9u, runner.Host.ReadDword(Label));
-        Assert.Equal(new[] { "barrier", "eop WriteBack32", "flush" }, runner.Host.Calls);
+        Assert.Equal(new[] { "barrier", "eop WriteBack32" }, runner.Host.Calls);
     }
 
     [Fact]
@@ -263,7 +292,7 @@ public sealed class GpuCommandInterpreterLabelTests
         runner.Host.WriteDword(Label, 4);
 
         runner.Run(ReleaseMemoryWrapped(0x28, 0, 1, 5, Label, 4, 1));
-        Assert.Equal(new[] { "eop InterruptOnly", "flush" }, runner.Host.Calls);
+        Assert.Equal(new[] { "eop InterruptOnly" }, runner.Host.Calls);
         Assert.Equal(4u, runner.Host.ReadDword(Label));
 
         runner.Host.Calls.Clear();

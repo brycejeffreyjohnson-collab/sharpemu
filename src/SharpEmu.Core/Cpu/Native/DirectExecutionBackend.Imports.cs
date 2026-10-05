@@ -185,6 +185,11 @@ public sealed partial class DirectExecutionBackend
 			return hotMemoryResult;
 		}
 
+		if (importStubEntry.IsTrivialLeaf && !_disableTrivialLeafDispatch)
+		{
+			return DispatchTrivialLeaf(cpuContext, in importStubEntry, argPackPtr, num);
+		}
+
 		if (importStubEntry.IsLeaf &&
 			TryDispatchLeafImport(cpuContext, importStubEntry, argPackPtr, num, out var leafResult))
 		{
@@ -339,6 +344,14 @@ public sealed partial class DirectExecutionBackend
 			}
 			Console.Error.WriteLine(
 				$"[LOADER][TRACE] bootstrap_call#{num}: op=0x{value:X16} sym_ptr=0x{value2:X16} sym='{symbolText}' out_ptr=0x{num3:X16} ret=0x{num7:X16}");
+		}
+		// Once the host is shutting down, a guest thread still running reaches no more HLE: the
+		// services behind the imports are being torn down, and a title that sees them fail (a null
+		// command buffer from the GPU library, say) crashes the process on its way out.
+		if (_forcedGuestExit && !ActiveForcedGuestExit && TryEndGuestSliceForShutdown(argPackPtr))
+		{
+			cpuContext[CpuRegister.Rax] = 1uL;
+			return 1uL;
 		}
 		if (!isGuestWorker &&
 			!ActiveForcedGuestExit &&
@@ -1231,6 +1244,17 @@ public sealed partial class DirectExecutionBackend
 			return TryReadHostQword(address, out value);
 		}
 
+		// Stack arguments sit on the calling guest thread's own stack, which the backend mapped read-write
+		// for the thread's lifetime and no tracker ever protects. Reading inside it needs no query: the
+		// cached range below is keyed by a mapping generation that every tracker protection change bumps,
+		// so falling through here cost a locked host region query per argument on nearly every import.
+		if (_activeGuestThreadState is { StackSize: > 0 } thread &&
+			address >= thread.StackBase && address <= thread.StackBase + thread.StackSize - sizeof(ulong))
+		{
+			value = *(ulong*)address;
+			return true;
+		}
+
 		var generation = HostMemory.MappingGeneration;
 		if (generation == _importReadableGeneration &&
 			address >= _importReadableStart && address <= _importReadableEnd - 8)
@@ -1494,6 +1518,68 @@ public sealed partial class DirectExecutionBackend
 		return true;
 	}
 
+	private static readonly bool _disableTrivialLeafDispatch = string.Equals(
+		Environment.GetEnvironmentVariable("SHARPEMU_DISABLE_TRIVIAL_LEAF"), "1", StringComparison.Ordinal);
+
+	// Tiny exports called millions of times per second, where the ~250ns of full
+	// import bookkeeping costs more than the export itself. Each one reads only
+	// argument registers (RDI..R9) and thread-local state, returns in RAX, never
+	// blocks, yields, calls back into the guest or reads the guest stack.
+	private static bool IsTrivialLeafImport(string nid) =>
+		nid is
+			"0-KXaS70xy4" or // pthread_getspecific
+			"eoht7mQOCmo" or // scePthreadGetspecific
+			"EI-5-jlq2dE" or // scePthreadGetthreadid
+			"3eqs37G74-s" or // pthread_getthreadid_np
+			"BNowx2l588E" or // sceKernelGetProcessTimeCounterFrequency
+			"fgxnMeTNUtY" or // sceKernelGetProcessTimeCounter
+			"4J2sUJmuHZQ" or // sceKernelGetProcessTime
+			"-2IRUCO--PM" or // sceKernelReadTsc
+			"1j3S3n-tTW4" or // sceKernelGetTscFrequency
+			"ob5xAW4ln-0" or // strchr
+			"9yDWMxEFdJU" or // strrchr
+			"V++UgBtQhn0";   // sceAgcGetDataPacketPayloadAddress
+
+	private unsafe ulong DispatchTrivialLeaf(
+		CpuContext cpuContext,
+		in ImportStubEntry importStubEntry,
+		nint argPackPtr,
+		long dispatchIndex)
+	{
+		// Polling loops on the host main thread use the time queries as loop-guard
+		// boundaries; keep resetting the pattern so skipping the guard here cannot
+		// turn a legitimate time-polling loop into a forced exit.
+		if (importStubEntry.IsLoopGuardBoundary && !GuestThreadExecution.IsGuestThread)
+		{
+			ResetImportLoopPattern();
+		}
+
+		cpuContext.Rip = importStubEntry.Address;
+		cpuContext[CpuRegister.Rdi] = *(ulong*)argPackPtr;
+		cpuContext[CpuRegister.Rsi] = *(ulong*)(argPackPtr + 8);
+		cpuContext[CpuRegister.Rdx] = *(ulong*)(argPackPtr + 16);
+		cpuContext[CpuRegister.Rcx] = *(ulong*)(argPackPtr + 24);
+		cpuContext[CpuRegister.R8] = *(ulong*)(argPackPtr + 32);
+		cpuContext[CpuRegister.R9] = *(ulong*)(argPackPtr + 40);
+		cpuContext.ClearRaxWriteFlag();
+		var returnValue = importStubEntry.Export!.Function(cpuContext);
+		if (!cpuContext.WasRaxWritten)
+		{
+			cpuContext[CpuRegister.Rax] = unchecked((ulong)returnValue);
+		}
+
+		if (returnValue != (int)OrbisGen2Result.ORBIS_GEN2_OK &&
+			ShouldLogImportResult(importStubEntry.Nid, (OrbisGen2Result)returnValue))
+		{
+			Console.Error.WriteLine(
+				$"[LOADER][WARN] Import#{dispatchIndex} result: {(OrbisGen2Result)returnValue} ({importStubEntry.Nid}) " +
+				$"rdi=0x{cpuContext[CpuRegister.Rdi]:X16} rsi=0x{cpuContext[CpuRegister.Rsi]:X16} " +
+				$"ret=0x{*(ulong*)(argPackPtr + 96):X16}");
+		}
+
+		return cpuContext[CpuRegister.Rax];
+	}
+
 	private static bool IsNoBlockLeafImport(string nid) =>
 		nid is
 			"8aI7R7WaOlc" or // sceAmprCommandBufferConstructor
@@ -1551,6 +1637,19 @@ public sealed partial class DirectExecutionBackend
 		var expectedEqueueTimeout =
 			string.Equals(nid, "fzyMKs9kim0", StringComparison.Ordinal) &&
 			result == OrbisGen2Result.ORBIS_GEN2_ERROR_TIMED_OUT;
+		// scePthreadCondTimedwait and sceKernelWaitEventFlag report an elapsed timeout.
+		var expectedWaitTimeout =
+			(nid is "BmMjYxmew1w" or "JTvBflhYazQ") &&
+			result == OrbisGen2Result.ORBIS_GEN2_ERROR_TIMED_OUT;
+		// scePthreadMutexLock on an error-checking mutex the caller already owns; titles use it
+		// to build their own recursive locks.
+		var expectedErrorCheckRelock =
+			string.Equals(nid, "9UK1vLZQft4", StringComparison.Ordinal) &&
+			result == OrbisGen2Result.ORBIS_GEN2_ERROR_DEADLOCK;
+		// scePadReadState on a handle that is not open; titles poll every pad slot.
+		var expectedPadNotOpen =
+			string.Equals(nid, "YndgXqQVV7c", StringComparison.Ordinal) &&
+			resultValue == unchecked((int)0x80920003);
 		var expectedMutexTrylockBusy =
 			(nid is "K-jXhbt2gn4" or "upoVrzMHFeE") &&
 			result == OrbisGen2Result.ORBIS_GEN2_ERROR_BUSY;
@@ -1575,6 +1674,9 @@ public sealed partial class DirectExecutionBackend
 		if (!expectedFileProbeMiss &&
 			!expectedTimedWaitTimeout &&
 			!expectedEqueueTimeout &&
+			!expectedWaitTimeout &&
+			!expectedErrorCheckRelock &&
+			!expectedPadNotOpen &&
 			!expectedMutexTrylockBusy &&
 			!expectedSemaphoreTrywaitAgain &&
 			!expectedPollSemaBusy &&
@@ -1767,6 +1869,20 @@ public sealed partial class DirectExecutionBackend
 		}
 	}
 
+	// Returns the import straight to the host entry stub, which ends this guest slice.
+	private unsafe bool TryEndGuestSliceForShutdown(nint argPackPtr)
+	{
+		ulong sentinel = ActiveEntryReturnSentinelRip;
+		if (sentinel < 65536 || !TryPatchActiveGuestReturnSlot(sentinel))
+		{
+			return false;
+		}
+
+		*(ulong*)(argPackPtr + 96) = sentinel;
+		ActiveForcedGuestExit = true;
+		return true;
+	}
+
 	private unsafe bool TryForceGuestExitToHostStub(nint argPackPtr, long dispatchIndex, ulong returnRip, string nid)
 	{
 		ulong num = ActiveEntryReturnSentinelRip;
@@ -1902,6 +2018,7 @@ public sealed partial class DirectExecutionBackend
 			"BmMjYxmew1w" or // scePthreadCondTimedwait
 			"Op8TBGY5KHg" or // pthread_cond_wait
 			"27bAgiJmOh0" or // pthread_cond_timedwait
+			"Zxa0VhQVTsk" or // sceKernelWaitSema
 			"n88vx3C5nW8" or // gettimeofday
 			"lLMT9vJAck0" or // clock_gettime
 			"-2IRUCO--PM" or // sceKernelReadTsc

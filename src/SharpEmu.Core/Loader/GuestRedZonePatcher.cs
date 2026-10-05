@@ -15,7 +15,7 @@ internal static class GuestRedZonePatcher
 {
     private const int GuestRedZoneBytes = 128;
     private const int MinimumJumpBytes = 5;
-    private const int EstimatedTrampolineBytesPerSite = 48;
+    private const int EstimatedTrampolineBytesPerSite = 64;
     private const ulong PageSize = 0x1000;
     private const ulong AllocationAlignment = 0x10000;
     private const ulong MaximumRelativeJumpDistance = 0x7FFF_FFFF;
@@ -207,7 +207,10 @@ internal static class GuestRedZonePatcher
 
                 functionCount++;
                 instructionCount += decoded.Count;
-                var usesRedZone = protectRedZone && decoded.Any(static entry => UsesRedZone(entry.Instruction));
+                var frameDelta = protectRedZone ? ComputeFramePointerDelta(decoded) : -1;
+                var usesRedZone = protectRedZone &&
+                    (decoded.Any(static entry => UsesRedZone(entry.Instruction)) ||
+                     decoded.Any(entry => UsesFramePointerRedZone(entry.Instruction, frameDelta)));
 
                 if (!usesRedZone && !splitVectorStores && !rewriteSha)
                 {
@@ -349,6 +352,41 @@ internal static class GuestRedZonePatcher
     /// behaviour can be pinned on the byte sequences that occur in real guest
     /// code rather than on a mocked decode.
     /// </summary>
+    // Test hook: the forward span a site at siteAddress gets, as the patcher builds it.
+    internal static bool TryBuildForwardSpan(
+        byte[] code,
+        ulong baseAddress,
+        ulong siteAddress,
+        out int spanLength,
+        out int coreStart,
+        out int coreCount)
+    {
+        spanLength = 0;
+        coreStart = 0;
+        coreCount = 0;
+        var decoded = DecodeFunction(code, baseAddress, baseAddress, baseAddress + (ulong)code.Length);
+        var siteIndex = -1;
+        for (var index = 0; index < decoded.Count; index++)
+        {
+            if (decoded[index].Instruction.IP == siteAddress)
+            {
+                siteIndex = index;
+                break;
+            }
+        }
+
+        if (siteIndex < 0 ||
+            !TryBuildPatchSpan(decoded, siteIndex, CollectBranchTargets(decoded), out var site, out _))
+        {
+            return false;
+        }
+
+        spanLength = site.ByteLength;
+        coreStart = site.CoreStart;
+        coreCount = site.CoreCount;
+        return true;
+    }
+
     internal static bool TryBuildEnclosingSpan(
         byte[] code,
         ulong baseAddress,
@@ -417,8 +455,13 @@ internal static class GuestRedZonePatcher
 
         if (coreStart < 0)
         {
-            coreCount = 0;
-            return false;
+            // Nothing in the span touches guest memory: it is a SHA or vector-store rewrite over
+            // register-only instructions. The span builder already refused anything that touches
+            // RSP, so the whole span can run inside the shift. Refusing it here left every SHA
+            // instruction unrewritten, trapping on each execution on hosts without SHA.
+            coreStart = 0;
+            coreCount = instructions.Count;
+            return true;
         }
 
         for (var index = coreStart; index <= coreEnd; index++)
@@ -519,10 +562,22 @@ internal static class GuestRedZonePatcher
     {
         refusal = SpanRefusal.None;
         var instructions = new List<Instruction>(3);
+        Instruction? terminalBranch = null;
         var byteLength = 0;
         for (var index = startIndex; index < decoded.Count && byteLength < MinimumJumpBytes; index++)
         {
             var instruction = decoded[index].Instruction;
+            if (index != startIndex &&
+                !branchTargets.Contains(instruction.IP) &&
+                IsRelocatableDirectBranch(instruction))
+            {
+                // A short access followed by its branch (TEST mem; JZ) closes the
+                // span with that branch; the trampoline runs it once RSP is restored.
+                terminalBranch = instruction;
+                byteLength += instruction.Length;
+                break;
+            }
+
             if (instruction.FlowControl != FlowControl.Next)
             {
                 refusal = SpanRefusal.ControlFlow;
@@ -560,9 +615,14 @@ internal static class GuestRedZonePatcher
             return false;
         }
 
-        site = new PatchSite(decoded[startIndex].Instruction.IP, byteLength, instructions, coreStart, coreCount);
+        site = new PatchSite(decoded[startIndex].Instruction.IP, byteLength, instructions, coreStart, coreCount, terminalBranch);
         return true;
     }
+
+    private static bool IsRelocatableDirectBranch(in Instruction instruction) =>
+        instruction.FlowControl is FlowControl.ConditionalBranch or FlowControl.UnconditionalBranch &&
+        instruction.OpCount == 1 &&
+        instruction.GetOpKind(0) is OpKind.NearBranch16 or OpKind.NearBranch32 or OpKind.NearBranch64;
 
     internal static bool UsesRedZone(in Instruction instruction)
     {
@@ -573,6 +633,84 @@ internal static class GuestRedZonePatcher
 
         var displacement = unchecked((long)instruction.MemoryDisplacement64);
         return displacement < 0 && displacement >= -GuestRedZoneBytes;
+    }
+
+    // Clang spills into the red zone through the frame pointer as often as through
+    // RSP: with a standard 'push rbp; mov rbp, rsp' frame plus N callee-saved
+    // pushes, RSP sits at RBP-N, so every [rbp-d] with d > N is below RSP and a
+    // host exception frame would overwrite it. Matching only RSP-relative use left
+    // those functions unprotected.
+    internal static bool UsesFramePointerRedZone(in Instruction instruction, int frameDelta)
+    {
+        if (frameDelta < 0 || !HasMemoryOperand(instruction) || instruction.MemoryBase != Register.RBP)
+        {
+            return false;
+        }
+
+        var displacement = unchecked((long)instruction.MemoryDisplacement64);
+        return displacement < -frameDelta && displacement >= -(frameDelta + (long)GuestRedZoneBytes);
+    }
+
+    // Distance from the frame pointer down to RSP for a standard prologue, or -1
+    // when the function does not establish one. Only the leading pushes and the
+    // first 'sub rsp, imm' count, which under-estimates frames that grow later:
+    // under-estimating only widens the guarded window, so it stays conservative.
+    private static int ComputeFramePointerDelta(List<DecodedInstruction> decoded)
+    {
+        if (decoded.Count < 2)
+        {
+            return -1;
+        }
+
+        var push = decoded[0].Instruction;
+        if (push.Mnemonic != Mnemonic.Push ||
+            push.OpCount != 1 ||
+            push.GetOpKind(0) != OpKind.Register ||
+            push.GetOpRegister(0) != Register.RBP)
+        {
+            return -1;
+        }
+
+        var move = decoded[1].Instruction;
+        if (move.Mnemonic != Mnemonic.Mov ||
+            move.OpCount != 2 ||
+            move.GetOpKind(0) != OpKind.Register ||
+            move.GetOpRegister(0) != Register.RBP ||
+            move.GetOpKind(1) != OpKind.Register ||
+            move.GetOpRegister(1) != Register.RSP)
+        {
+            return -1;
+        }
+
+        var delta = 0;
+        for (var index = 2; index < decoded.Count; index++)
+        {
+            var instruction = decoded[index].Instruction;
+            if (instruction.Mnemonic == Mnemonic.Push &&
+                instruction.OpCount == 1 &&
+                instruction.GetOpKind(0) == OpKind.Register)
+            {
+                delta += 8;
+                continue;
+            }
+
+            if (instruction.Mnemonic == Mnemonic.Sub &&
+                instruction.OpCount == 2 &&
+                instruction.GetOpKind(0) == OpKind.Register &&
+                instruction.GetOpRegister(0) == Register.RSP &&
+                instruction.GetOpKind(1) is OpKind.Immediate8 or OpKind.Immediate8to64 or OpKind.Immediate32to64 or OpKind.Immediate32)
+            {
+                var immediate = (long)instruction.GetImmediate(1);
+                if (immediate > 0 && immediate < int.MaxValue - delta)
+                {
+                    delta += (int)immediate;
+                }
+            }
+
+            break;
+        }
+
+        return delta;
     }
 
     private static bool UsesStackMemory(in Instruction instruction)
@@ -704,7 +842,20 @@ internal static class GuestRedZonePatcher
         }
 
         var relocated = writer.ToArray();
-        var trampolineLength = checked(prefixLength + 5 + relocated.Length + 8 + 5);
+        byte[]? branch = null;
+        if (site.TerminalBranch is { } terminalBranch &&
+            !TryEncodeSegment(
+                [terminalBranch],
+                0,
+                1,
+                trampolineCursor + (ulong)prefixLength + 5 + (ulong)relocated.Length + 8,
+                out branch))
+        {
+            return false;
+        }
+
+        var branchLength = branch?.Length ?? 0;
+        var trampolineLength = checked(prefixLength + 5 + relocated.Length + 8 + branchLength + 5);
         if (trampolineCursor > trampolineEnd || (ulong)trampolineLength > trampolineEnd - trampolineCursor)
         {
             return false;
@@ -729,7 +880,10 @@ internal static class GuestRedZonePatcher
         trampoline[restoreOffset + 5] = 0;
         trampoline[restoreOffset + 6] = 0;
         trampoline[restoreOffset + 7] = 0;
-        var returnJumpOffset = restoreOffset + 8;
+        // LEA leaves the flags alone, so a conditional branch still sees the
+        // result of the relocated compare.
+        branch?.CopyTo(trampoline, restoreOffset + 8);
+        var returnJumpOffset = restoreOffset + 8 + branchLength;
         if (!TryWriteRelativeJump(
                 trampoline.AsSpan(returnJumpOffset, 5),
                 trampolineCursor + (ulong)returnJumpOffset,
@@ -812,6 +966,34 @@ internal static class GuestRedZonePatcher
             }
         }
 
+        // The image can sit among dense host allocations (the runtime's own heaps) where
+        // every fixed step above is taken. Look for any free range in reach instead.
+        var low = Math.Max(maximumSite > MaximumRelativeJumpDistance ? maximumSite - MaximumRelativeJumpDistance : 0, AllocationAlignment);
+        var highExclusive = minimumSite <= ulong.MaxValue - MaximumRelativeJumpDistance - 1
+            ? minimumSite + MaximumRelativeJumpDistance + 1
+            : ulong.MaxValue;
+        foreach (var candidate in memory.EnumerateFreeHostRanges(low, highExclusive, requiredBytes, AllocationAlignment))
+        {
+            if (!CanReach(candidate, minimumSite) ||
+                !CanReach(candidate + requiredBytes - 1, maximumSite))
+            {
+                continue;
+            }
+
+            try
+            {
+                address = memory.AllocateAt(candidate, requiredBytes, executable: true, allowAlternative: false);
+                if (address == candidate)
+                {
+                    return true;
+                }
+            }
+            catch (InvalidOperationException)
+            {
+                // Taken since it was listed; keep looking.
+            }
+        }
+
         address = 0;
         return false;
     }
@@ -870,7 +1052,8 @@ internal static class GuestRedZonePatcher
         int ByteLength,
         IList<Instruction> Instructions,
         int CoreStart,
-        int CoreCount);
+        int CoreCount,
+        Instruction? TerminalBranch = null);
 
     internal readonly record struct PatchResult
     {

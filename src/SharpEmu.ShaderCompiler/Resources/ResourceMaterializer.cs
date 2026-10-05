@@ -111,6 +111,12 @@ public static class ResourceMaterializer
         return true;
     }
 
+    // Evaluates only the flattened table, laid out as a full materialization lays it out
+    // before specialization; the written device-address slots are left zero for the caller.
+    public static bool TryEvaluateTable(ShaderResourcePlan plan, ResourceRuntimeInputs inputs, out uint[] table) =>
+        RuntimeValueEvaluator.EvaluateSources(plan, [], inputs, plan.CleanFlatSlots, evaluateTable: true, out _, out table, out _,
+            additionalTableWords: checked(plan.WrittenRangeCount * ShaderResourcePlan.WrittenRangeDwordCount));
+
     // ---- snapshot ----
 
     private static bool MaterializeSnapshot(ShaderResourcePlan plan, ResourceRuntimeInputs inputs,
@@ -161,8 +167,7 @@ public static class ResourceMaterializer
                     for (var candidateIndex = 0; candidateIndex < descriptors.Count; candidateIndex++)
                     {
                         var descriptor = descriptors[candidateIndex];
-                        if (NullImageDescriptor(descriptor.Dwords) || !ValidImageDescriptor(descriptor.Dwords, image.R128) ||
-                            !ReservedImageBitsClear(descriptor.Dwords))
+                        if (!UsableImageCandidate(descriptor.Dwords, image.R128))
                             descriptor = DescriptorWords.Empty(8);
                         var existing = directTable.Descriptors.FindIndex(candidate => candidate.SameAs(descriptor));
                         if (existing < 0)
@@ -468,6 +473,19 @@ public static class ResourceMaterializer
         return value.ToString();
     }
 
+    private static readonly HashSet<uint> NulledSampledFormats = new();
+
+    private static void ReportNulledSampledFormat(uint format)
+    {
+        lock (NulledSampledFormats)
+        {
+            if (NulledSampledFormats.Add(format))
+            {
+                Console.Error.WriteLine($"[GPU][WARN] A sampled image descriptor uses unsupported format {format}; it is bound as a null texture.");
+            }
+        }
+    }
+
     private static bool NullImageDescriptor(ReadOnlySpan<uint> descriptor) =>
         descriptor[0] == 0 && (descriptor[1] & 0xFF) == 0;
 
@@ -524,6 +542,10 @@ public static class ResourceMaterializer
 
         return true;
     }
+
+    private static bool UsableImageCandidate(ReadOnlySpan<uint> candidate, bool r128) =>
+        !NullImageDescriptor(candidate) && ValidImageDescriptor(candidate, r128) && ReservedImageBitsClear(candidate) &&
+        GuestImageFormat.SampledNumericClass(GuestImageFormat.FormatOf(candidate)) != ImageNumericClass.Unsupported;
 
     private static ulong ScalarBufferSize(ReadOnlySpan<uint> descriptor)
     {
@@ -634,8 +656,7 @@ public static class ResourceMaterializer
                 }
             }
 
-            if (NullImageDescriptor(candidate) || !ValidImageDescriptor(candidate, image.R128) ||
-                !ReservedImageBitsClear(candidate))
+            if (!UsableImageCandidate(candidate, image.R128))
             {
                 Array.Clear(candidate);
             }
@@ -688,8 +709,7 @@ public static class ResourceMaterializer
                     return false;
             }
 
-            if (NullImageDescriptor(candidate) || !ValidImageDescriptor(candidate, r128) ||
-                !ReservedImageBitsClear(candidate))
+            if (!UsableImageCandidate(candidate, r128))
                 Array.Clear(candidate);
             probed.Add(candidate);
         }
@@ -746,7 +766,7 @@ public static class ResourceMaterializer
                     return false;
             }
 
-            if (NullImageDescriptor(candidate) || !ValidImageDescriptor(candidate, r128) || !ReservedImageBitsClear(candidate))
+            if (!UsableImageCandidate(candidate, r128))
                 Array.Clear(candidate);
             probed.Add(candidate);
             offsets.Add(unchecked(indirect.DynamicOffsetBase + (key << 5)));
@@ -1047,7 +1067,19 @@ public static class ResourceMaterializer
                     numericClass = ImageNumericClass.Uint;
                 }
             }
-            else if (numericClass == ImageNumericClass.Unsupported || (baseImage.DepthCompare && numericClass != ImageNumericClass.Float))
+            else if (numericClass == ImageNumericClass.Unsupported)
+            {
+                ReportNulledSampledFormat(format);
+                Array.Clear(descriptor);
+                images[index] = image with
+                {
+                    NumericClass = ImageNumericClass.Float,
+                    Dimension = ImageDimension.Dim2D,
+                    Cube = false,
+                };
+                continue;
+            }
+            else if (baseImage.DepthCompare && numericClass != ImageNumericClass.Float)
             {
                 return Fail($"sampled image descriptor {index} uses unsupported format {format}");
             }
@@ -1175,6 +1207,35 @@ public static class ResourceMaterializer
                 snapshot.Samplers[target] = snapshot.Samplers[index];
             }
         }
+
+        // ApplyTo appends a depth-compare copy of every sampler shared by ordinary and
+        // depth-reference sampling, after the point samplers; the snapshot needs the same words there.
+        var compareUsage = new byte[ShaderResourceInfo.MaxSamplers];
+        foreach (var pair in info.SampledPairs)
+        {
+            var image = info.Images[(int)pair.Image];
+            var specialized = images[(int)pair.Image];
+            var sampler = RequiresPointSampler(specialized.NumericClass, specialized.ConversionFormat)
+                ? samplerPlan.PointSampler[pair.Sampler]
+                : pair.Sampler;
+            var depthCompare = image.DepthCompare && specialized.EmulatedCompareFunction < 0;
+            compareUsage[sampler] |= depthCompare ? (byte)2 : (byte)1;
+        }
+
+        for (var index = 0; index < snapshot.Samplers.Length && index < compareUsage.Length; index++)
+        {
+            if (compareUsage[index] == 3)
+            {
+                if (snapshot.Samplers.Length >= ShaderResourceInfo.MaxSamplers)
+                {
+                    return Fail("specialized sampler layout exceeds its resource limit");
+                }
+
+                Array.Resize(ref snapshot.Samplers, snapshot.Samplers.Length + 1);
+                snapshot.Samplers[^1] = snapshot.Samplers[index];
+            }
+        }
+
 
         // Bounded runtime V# candidates are appended after the plan's buffers; each draw
         // owns their words and the run-time key mapping sits in the flattened table.

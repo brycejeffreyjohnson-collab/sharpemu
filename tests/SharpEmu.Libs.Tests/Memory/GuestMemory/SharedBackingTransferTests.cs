@@ -22,22 +22,18 @@ public sealed unsafe class SharedBackingTransferTests
         var source = mapping.Address + Segment - (ulong)data.Length;
         var destination = mapping.Address + 2 * Segment - (ulong)data.Length;
         Assert.True(mapping.Store.TryWriteBacking(source, data));
-        for (var iteration = 0; iteration < 256; iteration++)
+        var succeeded = true;
+        void Transfer(int count)
         {
-            Assert.True(copy
-                ? mapping.Store.TryCopyBacking(destination, source, (ulong)data.Length)
-                : mapping.Store.TryWriteBacking(destination, data));
+            for (var iteration = 0; iteration < count; iteration++)
+            {
+                succeeded &= copy
+                    ? mapping.Store.TryCopyBacking(destination, source, (ulong)data.Length)
+                    : mapping.Store.TryWriteBacking(destination, data);
+            }
         }
 
-        var initialAllocation = GC.GetAllocatedBytesForCurrentThread();
-        var succeeded = true;
-        for (var iteration = 0; iteration < 1024; iteration++)
-        {
-            succeeded &= copy
-                ? mapping.Store.TryCopyBacking(destination, source, (ulong)data.Length)
-                : mapping.Store.TryWriteBacking(destination, data);
-        }
-        var allocatedBytes = GC.GetAllocatedBytesForCurrentThread() - initialAllocation;
+        var allocatedBytes = AllocationMeasurement.SteadyState(() => Transfer(256), () => Transfer(1024));
 
         Assert.True(succeeded);
         Assert.Equal(0L, allocatedBytes);
@@ -116,6 +112,31 @@ public sealed unsafe class SharedBackingTransferTests
         Assert.True(mapping.Store.TryCopyBacking(mapping.Address + Segment, mapping.Address, (ulong)data.Length));
 
         Assert.Equal(Marker, *(ulong*)(mapping.Address + Segment));
+    }
+
+    [Fact]
+    public void AResolvedAliasReadsTheViewBytesUntilTheMappingChanges()
+    {
+        if (!Supported) return;
+        using var mapping = new TransferMappings();
+        Assert.True(mapping.Store.TryWriteBacking(mapping.Address + Segment + 8, BitConverter.GetBytes(Marker)));
+        var snapshot = mapping.Store.AliasSnapshot;
+        Assert.True(mapping.Store.TryEnterAliasAccess());
+        try
+        {
+            Assert.True(mapping.Store.TryResolveAlias(mapping.Address + Segment, 16, out var alias));
+            Assert.Equal(Marker, *(ulong*)(alias + 8));
+            Assert.Same(snapshot, mapping.Store.AliasSnapshot);
+            Assert.False(mapping.Store.TryResolveAlias(mapping.Address + Segment - 8, 16, out _));
+        }
+        finally
+        {
+            mapping.Store.ExitAliasAccess();
+        }
+
+        Assert.True(mapping.Store.Unmap(mapping.Address + Segment, Segment, out _));
+        Assert.NotSame(snapshot, mapping.Store.AliasSnapshot);
+        Assert.False(mapping.Store.TryResolveAlias(mapping.Address + Segment, 16, out _));
     }
 
     private sealed class TransferMappings : IDisposable

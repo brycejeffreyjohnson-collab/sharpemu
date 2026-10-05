@@ -28,6 +28,10 @@ internal static unsafe partial class VulkanVideoPresenter
     private const string DepthClipControlExtensionName = "VK_EXT_depth_clip_control";
     private const string DepthClipEnableExtensionName = "VK_EXT_depth_clip_enable";
     private const int DrawsPerBatch = 64;
+    // A full batch does not split an open render pass: ending it there flushed and
+    // restarted Demon's Souls' 1440p G-buffer pass (five targets + depth) every 64 draws.
+    // The pass still ends at this cap so a long pass cannot hold the batch forever.
+    private const int DrawsPerBatchInRenderPass = 512;
     private const uint SingleRectangleVertexCount = 4;
 
     private static void RequireRenderingFeature(bool supported, string feature, string deviceName)
@@ -66,45 +70,54 @@ internal static unsafe partial class VulkanVideoPresenter
                 }
 
                 owner._preparation = null;
-                streamRetention.Dispose();
-                if (StencilStorageImages is { } stencilImages)
+                owner._preparedTextures.Clear();
+                try
                 {
-                    foreach (var (attachment, storage) in stencilImages)
+                    streamRetention.Dispose();
+                    if (StencilStorageImages is { } stencilImages)
                     {
-                        try
+                        foreach (var (attachment, storage) in stencilImages)
                         {
-                            if (CommandsRecorded && StencilStorageWriteBackImages is not null &&
-                                StencilStorageWriteBackImages.Contains(attachment))
-                                attachment.CopyStencilStorage(storage, owner._bufferCache.GetUtilityBuffer(GpuBufferUsage.DeviceLocal), writeBack: true);
-                        }
-                        finally
-                        {
-                            owner._scheduler.QueueCompletionAction(storage.Dispose);
+                            try
+                            {
+                                if (CommandsRecorded && StencilStorageWriteBackImages is not null &&
+                                    StencilStorageWriteBackImages.Contains(attachment))
+                                    attachment.CopyStencilStorage(storage, owner._bufferCache.GetUtilityBuffer(GpuBufferUsage.DeviceLocal), writeBack: true);
+                            }
+                            finally
+                            {
+                                owner._scheduler.QueueCompletionAction(storage.Dispose);
+                            }
                         }
                     }
-                }
 
-                if (!Committed && FeedbackSnapshots is { } feedbackSnapshots)
-                {
-                    foreach (var snapshot in feedbackSnapshots)
+                    if (!Committed && FeedbackSnapshots is { } feedbackSnapshots)
                     {
-                        snapshot.Dispose();
+                        foreach (var snapshot in feedbackSnapshots)
+                        {
+                            snapshot.Dispose();
+                        }
+                    }
+
+                    if (Committed)
+                    {
+                        return;
+                    }
+
+                    foreach (var stage in Stages)
+                    {
+                        owner.DestroyStageBindings(stage);
+                    }
+
+                    foreach (var (buffer, memory) in OverflowBuffers)
+                    {
+                        owner.RecycleHostBuffer(buffer, memory);
                     }
                 }
-
-                if (Committed)
+                finally
                 {
-                    return;
-                }
-
-                foreach (var stage in Stages)
-                {
-                    owner.DestroyStageBindings(stage);
-                }
-
-                foreach (var (buffer, memory) in OverflowBuffers)
-                {
-                    owner.RecycleHostBuffer(buffer, memory);
+                    foreach (var stage in Stages) owner.ReturnStageScratch(stage);
+                    Stages.Clear();
                 }
             }
         }
@@ -113,6 +126,7 @@ internal static unsafe partial class VulkanVideoPresenter
         private bool _supportsDepthClipControl;
         private bool _supportsDepthClipEnable;
         private bool _supportsDepthBounds;
+        private bool _supportsFillRectangle;
         private RenderHostLimits _renderHostLimits;
         private IGuestBackedSpace _guestBacking = null!;
 
@@ -125,6 +139,14 @@ internal static unsafe partial class VulkanVideoPresenter
         private bool _renderingActive;
         private RenderingState _renderingState;
         private long _renderingScopesBegun;
+        // SHARPEMU_DEFER_GLOBAL_BARRIERS=0 ends the rendering scope at every guest cache flush again.
+        private static readonly bool DeferGlobalBarriers =
+            Environment.GetEnvironmentVariable("SHARPEMU_DEFER_GLOBAL_BARRIERS") != "0";
+        private bool _renderingWritesMemory;
+        private bool _nextDrawWritesMemory;
+        private bool _globalBarrierAfterRendering;
+        // Attachment barriers that order this rendering scope before later work; see TryDeferUntilRenderingEnds.
+        private readonly List<(PipelineStageFlags Source, PipelineStageFlags Destination, ImageMemoryBarrier2[] Barriers)> _barriersAfterRendering = new();
         private bool _hasBoundDepth;
         private DepthAttachmentState _boundDepth;
         private ImageLayout _boundDepthLayout;
@@ -152,7 +174,7 @@ internal static unsafe partial class VulkanVideoPresenter
             Console.Error.WriteLine(
                 $"[LOADER][INFO] Vulkan rendering extensions color_write_enable={(supportsColorWriteEnable ? 1 : 0)} " +
                 $"depth_clip_control={(_supportsDepthClipControl ? 1 : 0)} depth_clip_enable={(_supportsDepthClipEnable ? 1 : 0)} " +
-                $"depth_bounds={(_supportsDepthBounds ? 1 : 0)}");
+                $"depth_bounds={(_supportsDepthBounds ? 1 : 0)} fill_rectangle={(_supportsFillRectangle ? 1 : 0)}");
         }
 
         RenderHostLimits IRenderHost.Limits => _renderHostLimits;
@@ -173,7 +195,15 @@ internal static unsafe partial class VulkanVideoPresenter
             }
         }
 
-        public void RunPendingOperations() => RunPendingCommands();
+        public void RunPendingOperations()
+        {
+            RunPendingCommands();
+            if (_batchOpen && _preparation is null && _bufferCache?.HotWritePending == true)
+            {
+                EndRendering();
+                FlushBatchedGuestCommands();
+            }
+        }
 
         public void SetDebugInformation(RecordedOperation operation, ulong submitId, uint argument0, uint argument1, uint argument2, uint argument3, ulong argument4) =>
             _scheduler.Current.SetDebugInfo((uint)operation, submitId, argument0, argument1, argument2, argument3, argument4);
@@ -232,6 +262,12 @@ internal static unsafe partial class VulkanVideoPresenter
         public ResourceSlotIdentifier FindImage(ref ImageRequest request, bool exactFormat)
         {
             _ = BeginBatchedGuestCommands();
+            if (request.Role == ImageRole.ColorTarget && request.Description.DccSliceSize is var sliceSize and not 0)
+            {
+                _imageCache.SynchronizeGuestDccMetadata(request.Description.Metadata.Range.Address, sliceSize,
+                    request.View.BaseLayer, request.View.LayerCount);
+            }
+
             return _imageCache.FindImage(ref request, exactFormat);
         }
 
@@ -360,7 +396,7 @@ internal static unsafe partial class VulkanVideoPresenter
             // Acquire the decoded frame before any stage selects its movie texture planes.
             PumpHostMovieFrame();
 
-            if (_batchDrawCount >= DrawsPerBatch)
+            if (_batchDrawCount >= (_renderingActive ? DrawsPerBatchInRenderPass : DrawsPerBatch))
             {
                 EndRendering();
                 FlushBatchedGuestCommands();
@@ -451,6 +487,8 @@ internal static unsafe partial class VulkanVideoPresenter
                 }
             }
 
+            RecordSampledColorMetadataClears(bindings);
+
             // Create feedback copies after load clears have been materialized;
             // otherwise a shader would sample the pre-clear contents.
             PrepareDepthFeedback(bindings);
@@ -525,6 +563,66 @@ internal static unsafe partial class VulkanVideoPresenter
             (ulong)attachment.BaseLayer < (ulong)sampled.BaseLayer + sampled.LayerCount;
 
         // Clears the depth view with a transfer so the draw can sample the cleared image.
+        // A DCC fast clear stays pending until the surface binds as a color target. A shader that
+        // samples or writes the surface first must see the cleared contents, and the later bind must
+        // not clear over its writes: Astro Bot's save-slot cards were drawn by compute into a
+        // fast-cleared target, then wiped black by the deferred clear. The register clear color is
+        // known only when the surface is a target.
+        private void RecordSampledColorMetadataClears(TextureResource[] bindings)
+        {
+            const byte DccClearToZero = 0x00;
+            foreach (var binding in bindings)
+            {
+                if (binding.IsHostMovie || binding.CachedImage is not { } image || image.Description.Metadata.Kind != MetadataKind.Dcc)
+                {
+                    continue;
+                }
+
+                var metadataAddress = image.Description.Metadata.Range.Address;
+                var sliceSize = image.Description.DccSliceSize;
+                var fixedClearSupported = ImageRequestBuilders.SupportsDccFixedClear(image.Description.PixelFormat);
+                var view = binding.Request.View;
+                for (var layer = view.BaseLayer; layer < view.BaseLayer + view.LayerCount; layer++)
+                {
+                    var tracked = _imageCache.IsMetadataCleared(metadataAddress, layer, out var metadataValue) && (byte)metadataValue == DccClearToZero;
+                    var clearValue = default(ClearColorValue);
+                    ulong guestSlice = 0;
+                    if (!tracked &&
+                        (sliceSize == 0 || !_imageCache.TryReadGuestDccClear(metadataAddress, sliceSize, layer, out guestSlice, out var code) ||
+                         !TryDecodeDccClear(code, false, fixedClearSupported, default, out clearValue)))
+                    {
+                        continue;
+                    }
+
+                    EndRendering();
+                    var command = BeginBatchedGuestCommands();
+                    var range = new SubresourceRange(0, 1, layer, 1);
+                    image.Transition(ImageLayout.TransferDstOptimal, AccessFlags.TransferWriteBit, range, command);
+                    var vkRange = new ImageSubresourceRange(ImageAspectFlags.ColorBit, 0, 1, layer, 1);
+                    _vk.CmdClearColorImage(command, image.Backing.Handle, ImageLayout.TransferDstOptimal, &clearValue, 1, &vkRange);
+                    if (!tracked)
+                    {
+                        _bufferCache.FillBuffer(guestSlice, sliceSize, uint.MaxValue, false);
+                        if (RenderTrace.Enabled && RenderTrace.MetadataClear())
+                        {
+                            RenderTrace.Write(
+                                $"Materialized a guest DCC clear on a sampled image: metadata=0x{metadataAddress:X16} layer={layer} " +
+                                $"slice=0x{sliceSize:X} format={image.Description.PixelFormat}");
+                        }
+
+                        continue;
+                    }
+
+                    if (!_imageCache.SetMetadataSlice(metadataAddress, layer, false))
+                    {
+                        throw SubmissionScheduler.Fatal($"The DCC clear state could not be consumed: metadata=0x{metadataAddress:X16} layer={layer}.");
+                    }
+
+                    ConsumeGuestDccClears(image.Description, layer, 1);
+                }
+            }
+        }
+
         private void RecordSampledDepthClear(CachedImage image, in ImageViewDescription view, Format format)
         {
             var aspects = (_boundDepthLoadState.DepthClearEnabled ? ImageAspectFlags.DepthBit : 0) |
@@ -681,12 +779,23 @@ internal static unsafe partial class VulkanVideoPresenter
             using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DrawRenderingSetup);
             if (_renderingActive && _renderingState == state)
             {
+                _renderingWritesMemory |= _nextDrawWritesMemory;
+                _nextDrawWritesMemory = false;
                 return;
             }
 
             EndRendering();
             var command = BeginBatchedGuestCommands();
             _commandBuffer = command;
+            if (DeferGlobalBarriers)
+            {
+                // A guest cache flush inside this scope may be deferred to its end; this keeps
+                // everything recorded before the scope ordered before its draws either way.
+                RecordGlobalBarrier(command);
+            }
+
+            _renderingWritesMemory = _nextDrawWritesMemory;
+            _nextDrawWritesMemory = false;
             var colors = stackalloc RenderingAttachmentInfo[RenderingState.ColorAttachmentCapacity];
             for (var index = 0; index < state.ColorAttachmentCount; index++)
             {
@@ -765,7 +874,37 @@ internal static unsafe partial class VulkanVideoPresenter
 
             _renderingActive = false;
             _renderingState = default;
-            _vk.CmdEndRendering(new CommandBuffer(_scheduler.Current.Handle));
+            var command = new CommandBuffer(_scheduler.Current.Handle);
+            _vk.CmdEndRendering(command);
+            foreach (var (sourceStages, destinationStages, barriers) in _barriersAfterRendering)
+            {
+                fixed (ImageMemoryBarrier2* pointer = barriers)
+                {
+                    VulkanSynchronization.PipelineBarrier(_vk,
+                        command, sourceStages, destinationStages, DependencyFlags.ByRegionBit,
+                        0, null, 0, null, (uint)barriers.Length, pointer);
+                }
+            }
+
+            _barriersAfterRendering.Clear();
+            if (_globalBarrierAfterRendering)
+            {
+                _globalBarrierAfterRendering = false;
+                RecordGlobalBarrier(command);
+            }
+
+            _renderingWritesMemory = false;
+        }
+
+        void IRenderHost.PrepareMemoryWritingDraw()
+        {
+            // The store must not move ahead of a cache flush deferred inside this scope.
+            if (_globalBarrierAfterRendering)
+            {
+                EndRendering();
+            }
+
+            _nextDrawWritesMemory = true;
         }
 
         public void BindPipeline(PipelineBindPoint bindPoint, in PipelineHandle pipeline)
@@ -796,7 +935,7 @@ internal static unsafe partial class VulkanVideoPresenter
             _batchDrawCount++;
         }
 
-        // A single rectangle draws as a strip of four vertices; anything else draws as a triangle list.
+        // Existing strip compatibility path when native rectangle fill cannot be used.
         private static bool IsSingleRectangle(uint vertexCount) => vertexCount is 1 or 3 or 4;
 
         private void BindRectangleListVariant(RenderPipelineEntry entry, bool strip, CommandBuffer command)
@@ -810,6 +949,22 @@ internal static unsafe partial class VulkanVideoPresenter
             _vk.CmdBindPipeline(command, PipelineBindPoint.Graphics, variant);
         }
 
+        private void BindNativeRectangleList(RenderPipelineEntry entry, CommandBuffer command)
+        {
+            if (entry.RectangleVariant.Handle == 0)
+            {
+                entry.RectangleVariant = CreateRenderPipeline(entry.Description!, PrimitiveTopology.TriangleList,
+                    entry.Layout, PolygonMode.FillRectangleNV);
+            }
+
+            _vk.CmdBindPipeline(command, PipelineBindPoint.Graphics, entry.RectangleVariant);
+        }
+
+        // Rectangle2D consumes three vertices and fills their projected bounding box.
+        // Native fill preserves their interpolants and does not fetch a made-up fourth vertex.
+        private bool CanDrawNativeRectangles(uint vertexCount) =>
+            _supportsFillRectangle && vertexCount >= 3 && vertexCount % 3 == 0;
+
         public void Draw(uint vertexCount, uint instanceCount, uint firstVertex, uint firstInstance)
         {
             using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DrawRecording);
@@ -817,11 +972,18 @@ internal static unsafe partial class VulkanVideoPresenter
             var count = vertexCount;
             if (_boundGraphicsPipeline is { RectangleList: true } entry)
             {
-                var strip = IsSingleRectangle(vertexCount);
-                BindRectangleListVariant(entry, strip, command);
-                if (strip)
+                if (CanDrawNativeRectangles(vertexCount))
                 {
-                    count = SingleRectangleVertexCount;
+                    BindNativeRectangleList(entry, command);
+                }
+                else
+                {
+                    var strip = IsSingleRectangle(vertexCount);
+                    BindRectangleListVariant(entry, strip, command);
+                    if (strip)
+                    {
+                        count = SingleRectangleVertexCount;
+                    }
                 }
             }
 
@@ -838,13 +1000,43 @@ internal static unsafe partial class VulkanVideoPresenter
             var command = BeginBatchedGuestCommands();
             if (_boundGraphicsPipeline is { RectangleList: true } entry)
             {
-                BindRectangleListVariant(entry, strip: false, command);
+                if (CanDrawNativeRectangles(indexCount))
+                {
+                    BindNativeRectangleList(entry, command);
+                }
+                else
+                {
+                    BindRectangleListVariant(entry, strip: false, command);
+                }
             }
 
             _gpuCommandProfile?.WriteMarker(command, VulkanCommandProfile.IntervalKind.Preparation);
             _vk.CmdDrawIndexed(command, indexCount, instanceCount, firstIndex, vertexOffset, firstInstance);
             _gpuCommandProfile?.WriteMarker(command, VulkanCommandProfile.IntervalKind.DrawIndexed,
                 _boundGraphicsPipeline?.Id ?? 0, indexCount, instanceCount);
+            CountDraw();
+        }
+
+        void IRenderHost.DrawIndexedIndirect(BufferBinding arguments)
+        {
+            using var profileScope = RenderPhaseProfile.MeasureDetail(RenderPhaseProfile.Phase.DrawRecording);
+            var command = BeginBatchedGuestCommands();
+            if (_boundGraphicsPipeline is { RectangleList: true } entry)
+            {
+                if (_supportsFillRectangle)
+                {
+                    BindNativeRectangleList(entry, command);
+                }
+                else
+                {
+                    BindRectangleListVariant(entry, strip: false, command);
+                }
+            }
+
+            _gpuCommandProfile?.WriteMarker(command, VulkanCommandProfile.IntervalKind.Preparation);
+            _vk.CmdDrawIndexedIndirect(command, new VkBuffer(arguments.Handle), arguments.Offset, 1, 20);
+            _gpuCommandProfile?.WriteMarker(command, VulkanCommandProfile.IntervalKind.DrawIndexed,
+                _boundGraphicsPipeline?.Id ?? 0, 0, 0);
             CountDraw();
         }
 
@@ -997,5 +1189,19 @@ internal static unsafe partial class VulkanVideoPresenter
         }
 
         public bool TryAbsorbDccFill(ulong address, ulong size, uint fillValue) => _imageCache.TryAbsorbDccFill(address, size, fillValue);
+
+        public bool TryFillDccMetadata(ulong address, ulong size, uint fillValue)
+        {
+            if (!_imageCache.OverlapsDccMetadata(address, size))
+            {
+                return false;
+            }
+
+            _bufferCache.FillDccMetadata(address, size, fillValue);
+            return true;
+        }
+
+        public bool TryCopyWordsOnHost(ulong destination, ulong source, ulong sourceWords, ulong words) =>
+            _bufferCache.TryCopyWordsOnHost(destination, source, sourceWords, words);
     }
 }

@@ -18,6 +18,14 @@ public sealed class ResourceRuntimeInputs
     public GuestWordReader? ReadCleanMemory { get; init; }
     public ComputeSelectorState? ComputeState { get; init; }
 
+    // Told true before the flattened table's words are evaluated and false after, so a reader
+    // wrapper can tell the words only the table reads from those the descriptors depend on.
+    public Action<bool>? TablePhase { get; init; }
+
+    public ResidentGuestBytesReader? ReadResidentMemory { get; init; }
+
+    public bool ReadsClean { get; init; }
+
     public ResourceRuntimeInputs WithReader(GuestWordReader? reader) => new()
     {
         UserData = UserData,
@@ -25,6 +33,9 @@ public sealed class ResourceRuntimeInputs
         ReadMemory = reader,
         ReadCleanMemory = ReadCleanMemory,
         ComputeState = ComputeState,
+        TablePhase = TablePhase,
+        ReadResidentMemory = ReadResidentMemory,
+        ReadsClean = ReadsClean || ReferenceEquals(reader, ReadCleanMemory),
     };
 }
 

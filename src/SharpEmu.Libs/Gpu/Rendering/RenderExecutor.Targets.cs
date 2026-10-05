@@ -51,6 +51,17 @@ public sealed partial class RenderExecutor
         }
 
         state.PixelActive = HasActivePixelShader(banks);
+        if (state.ColorCount == 0 && !state.Depth.HasTarget && !state.PixelActive &&
+            VertexStageWritesMemory(banks, ref state))
+        {
+            // No attachment and no pixel stage, but the vertex (or emulated geometry) stage
+            // still stores to memory: a GPU-culling or stream-out pass whose only output is
+            // the buffer a later indirect draw reads. Rasterization has nothing to write, so
+            // the draw runs for its stores alone.
+            TraceDrawDisposition(banks, in draw, "vertex-stores-only");
+            return true;
+        }
+
         if (state.ColorCount == 0 && !state.Depth.HasTarget && !state.PixelActive)
         {
             TraceDrawDisposition(banks, in draw, "no-framebuffer");
@@ -65,6 +76,21 @@ public sealed partial class RenderExecutor
         }
 
         return true;
+    }
+
+    // Whether the bound vertex (or emulated geometry) stage stores to a buffer or a
+    // storage image, which is the only observable effect a draw without attachments
+    // and without a pixel stage can have.
+    private bool VertexStageWritesMemory(RegisterBanks banks, ref DrawState state)
+    {
+        if (banks.Shader.Vertex.ExportAddress == 0)
+        {
+            return false;
+        }
+
+        ResolveShaderPrograms(banks, ref state);
+        var stage = state.Programs.VertexInput.Stage;
+        return stage.Program is { } program && (WritesStorageImage(program) || HasBufferWrites(stage));
     }
 
     // Color control mode 3 resolves slot 0 into slot 1 instead of drawing; true consumes the draw.
@@ -171,6 +197,39 @@ public sealed partial class RenderExecutor
 
     private static bool IsSupportedSampleCount(uint samples) => samples is 1 or 2 or 4 or 8;
 
+    // A depth pass can leave a color target bound that it never writes (target mask 0, or a
+    // slot the pixel program does not export). Hardware bounds such a draw only by the
+    // scissor, but a host attachment also bounds the render area: a 1024x1024 color target
+    // left bound by Astro Bot's depth clear kept the clear out of most of a 1080p depth buffer.
+    // The pixel outputs drop the same slots (ShaderPipelineCache.ResolveBoundTargets), so host
+    // locations stay dense and aligned with the remaining attachments.
+    private static void DropUnwrittenColorTargets(ContextRegisters context, ref DrawState state, ShaderProgramInfo? pixelProgram)
+    {
+        if (!state.Depth.HasTarget)
+        {
+            return;
+        }
+
+        var exportMasks = pixelProgram?.PixelColorExportMasks ?? 0u;
+        var kept = 0u;
+        for (var i = 0; i < state.ColorCount; i++)
+        {
+            ref readonly var target = ref state.Colors[i];
+            if (IsUnwrittenColorTarget(context, target.Slot, target.Resolution.ExportMapping, exportMasks))
+            {
+                continue;
+            }
+
+            state.Colors[(int)kept++] = target;
+        }
+
+        state.ColorCount = kept;
+    }
+
+    internal static bool IsUnwrittenColorTarget(ContextRegisters context, uint slot, ColorComponentMap exportMapping, uint pixelColorExportMasks) =>
+        exportMapping.ApplyMask(context.RenderTargetMaskForSlot(slot)) == 0 ||
+        ((pixelColorExportMasks >> (int)(slot * 4)) & 0xFu) == 0;
+
     // Acquires every attachment through the host and assembles the rendering scope.
     private RenderingState AcquireAttachments(ref DrawState state)
     {
@@ -251,7 +310,9 @@ public sealed partial class RenderExecutor
             }
 
             var loadState = depth.LoadState;
-            var layout = loadState.AttachmentLayout(target.Format);
+            var layout = _host.SamplesDepthAttachment(in depth)
+                ? loadState.AttachmentLayout(target.Format)
+                : DepthStencilState.WritableAttachmentLayout(target.Format);
             _host.TransitionDepthAttachment(in depth, layout, loadState.AttachmentWriteAspects(target.Format));
             var view = target.Request.View;
             rendering.Width = Math.Min(rendering.Width, target.Width);
